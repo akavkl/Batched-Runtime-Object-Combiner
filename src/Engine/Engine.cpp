@@ -1,5 +1,6 @@
 #include "Engine/Engine.h"
 
+#include <intrin.h>
 #include <unordered_set>
 
 namespace RC::Engine
@@ -39,6 +40,8 @@ namespace RC::Engine
 		constexpr std::uint64_t kGameResetID = 124452;         // Main::PerformGameReset                   0x140D3B800
 		constexpr std::size_t   kGameResetPurgeSite = 0x2ED;   //   call 1075115 (E8 rel32), after TES::ClearAllCells
 		constexpr std::uint64_t kPurgeCellsID = 1075115;       // TES::PurgeBufferedCells                  0x1400F70A0
+		// The loading menu closes in TES::HideLoadingMenu (FO4-ENGINE-NOTES 7.15).
+		constexpr std::uint64_t kHideLoadingMenuID = 874976;   // TES::HideLoadingMenu                     0x1400FB360
 		constexpr std::size_t   kCanMergeSlot = 0x31;          // BSShaderProperty::CanMerge(BSShaderProperty*)
 
 		// TES and the exterior cell grid (layouts from CBRO's Compat.h).
@@ -746,10 +749,49 @@ namespace RC::Engine
 			g_resetAfter();
 		}
 
+		// Every engine call to TES::HideLoadingMenu (E8 rel32; 7.15).
+		struct HideSite
+		{
+			std::uint64_t id;
+			std::size_t   offset;
+			const char*   name;
+		};
+		constexpr HideSite kHideSites[] = {
+			{ 1014572, 0x25A, "BGSSaveLoadManager::EndLoadGame" },
+			{ 1096651, 0x496, "TES::LoadInterior" },
+			{ 1386854, 0x4BA, "TES::LeaveInterior" },
+			{ 146861, 0x104A, "id 146861" },
+			{ 633524, 0x195, "Main::OnIdle" },
+			{ 826184, 0x160, "Main::StartOfFrameUpdate" },
+			{ 124452, 0x678, "Main::PerformGameReset" },
+			{ 665510, 0xC5B, "Main::StartUp" },
+			{ 933696, 0x6D, "id 933696" },
+		};
+		std::array<std::uintptr_t, std::size(kHideSites)> g_hideSites{};
+
+		using HideFunc = void (*)(void*, void*, bool, float, bool);
+		HideFunc g_hideOriginal{ nullptr };
+		void (*g_hideBefore)(const char*) { nullptr };
+
+		// TES::HideLoadingMenu(TES*, BGSLocation*, bool, float, bool): rcx is the TES singleton, the fifth argument is
+		// on the stack (EndLoadGame+0x25A). The caller is told by the return address (the trampoline jumps).
+		void HideLoadingMenuThunk(void* a_tes, void* a_location, bool a_flag, float a_fadeTime, bool a_flag2)
+		{
+			const auto  site = reinterpret_cast<std::uintptr_t>(_ReturnAddress()) - 5;
+			const char* caller = "an unknown caller";
+			for (std::size_t i = 0; i < std::size(kHideSites); ++i) {
+				if (g_hideSites[i] == site) {
+					caller = kHideSites[i].name;
+				}
+			}
+			g_hideBefore(caller);
+			g_hideOriginal(a_tes, a_location, a_flag, a_fadeTime, a_flag2);
+		}
+
 		// One trampoline for every call-site hook (allocating again would replace it).
 		F4SE::Trampoline& Trampoline()
 		{
-			static const bool allocated = (F4SE::AllocTrampoline(128), true);
+			static const bool allocated = (F4SE::AllocTrampoline(256), true);
 			(void)allocated;
 			return F4SE::GetTrampoline();
 		}
@@ -803,5 +845,34 @@ namespace RC::Engine
 		g_resetAfter = a_after;
 		g_purgeOriginal = reinterpret_cast<PurgeFunc>(Trampoline().write_call<5>(site, &GameResetPurgeThunk));
 		return true;
+	}
+
+	std::uint32_t InstallLoadingMenuHook(void (*a_before)(const char*))
+	{
+		bool       ok = true;
+		const auto hide = Resolve(kHideLoadingMenuID, "TES::HideLoadingMenu", ok);
+		if (!ok || !a_before) {
+			return 0;
+		}
+		g_hideBefore = a_before;
+		std::uint32_t hooked = 0;
+		for (std::size_t i = 0; i < std::size(kHideSites); ++i) {
+			const auto& entry = kHideSites[i];
+			bool        found = true;
+			const auto  function = Resolve(entry.id, entry.name, found);
+			if (!found) {
+				continue;
+			}
+			const auto site = function + entry.offset;
+			if (CallTarget(site) != hide) {
+				logger::warn("{}+0x{:X} is not the engine's call to TES::HideLoadingMenu (byte {:02X}): that path closes the loading menu "
+							 "before combining", entry.name, entry.offset, *reinterpret_cast<const std::uint8_t*>(site));
+				continue;
+			}
+			g_hideOriginal = reinterpret_cast<HideFunc>(Trampoline().write_call<5>(site, &HideLoadingMenuThunk));
+			g_hideSites[i] = site;
+			++hooked;
+		}
+		return hooked;
 	}
 }

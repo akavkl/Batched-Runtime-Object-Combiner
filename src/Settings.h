@@ -25,6 +25,8 @@ namespace RC
 		                                          // (3 in run 35 more than doubled the solos and the far cascade's draws)
 		float         groupSize{ -1.0F };         // chunk group nodes: one per square of this size per parent; 0 = one per parent;
 		                                          // below 0 = auto (0 with CBRO, 1024 without)
+		bool          combineDuringLoad{ true };  // combine every attached cell before the loading menu closes
+		std::uint32_t loadWaitMs{ 5000 };         // the longest the loading menu is held for it; the rest finishes after
 
 		// [Debug]
 		bool          logCells{ true };              // one line per combined cell

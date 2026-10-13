@@ -1,6 +1,6 @@
 {
   "name": "runtime-combiner",
-  "version-string": "0.3.1",
+  "version-string": "0.4.0",
   "description": "Runtime Combiner: runtime replacement for Fallout 4 precombined meshes (F4SE plugin)",
   "builtin-baseline": "9cd6dd9009d2a9b27dd943aa0ca2ca6cd61a4089",
   "dependencies": [

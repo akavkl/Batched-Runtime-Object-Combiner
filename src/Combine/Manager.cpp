@@ -123,6 +123,7 @@ namespace RC::Combine::Manager
 			std::vector<Parking>     parking;
 			std::uint64_t            frame{ 0 };         // applied at this tick
 			bool                     fallback{ false };  // originals shown again and chunks hidden: revert pending
+			bool                     previsPending{ false };  // applied under the loading menu: roots leave previs later (TakeOutLoaded)
 		};
 
 		// Hangs beside a parent's containers and tells whether the main view draws what hangs there (Engine::NewProbe).
@@ -183,6 +184,10 @@ namespace RC::Combine::Manager
 		bool          g_keyDown{ false };
 		std::size_t   g_watchCursor{ 0 };
 		std::atomic<DWORD> g_mainThread{ 0 };  // the thread running PlayerCharacter::Update (set by the first tick)
+		// Held by the tick, the previs callback, a direct object event and the loading-menu pass (LoadPass), which runs
+		// on whatever thread closes the menu (the loader for a save load). The frame's callbacks only try it: a frame
+		// that finds it held skips RC's work rather than wait. Recursive: an object event inside the tick is direct.
+		std::recursive_timed_mutex g_stateMutex;
 		std::atomic<bool>  g_resetPending{ false };
 		std::uintptr_t g_originalUpdate{ 0 };
 		Clock::time_point g_lastSummary{};
@@ -768,7 +773,8 @@ namespace RC::Combine::Manager
 		// (Engine::SeenByMainView): for the audit.
 		void OnPrevisQuery() noexcept
 		{
-			if (!Engine::PrevisActive()) {
+			std::unique_lock lock{ g_stateMutex, std::try_to_lock };
+			if (!lock || !Engine::PrevisActive()) {
 				return;
 			}
 			g_previsTick = g_frame;
@@ -869,7 +875,8 @@ namespace RC::Combine::Manager
 			return count;
 		}
 
-		void Apply(Job& a_job, CellState& a_state)
+		// a_loading: under the loading menu (LoadPass).
+		void Apply(Job& a_job, CellState& a_state, bool a_loading)
 		{
 			const auto start = Clock::now();
 			// One TriShape (or none) per chunk, in bucket-major order: anything else is a bookkeeping error, and
@@ -880,12 +887,13 @@ namespace RC::Combine::Manager
 			}
 			// With bChunkFadeNodes, a cell gathered while its references are still fading in after attach: each chunk
 			// carries on from the furthest fade among its originals, read before they are hidden. An original this
-			// plugin hid is drawn by the old chunk, faded in (FO4-ENGINE-NOTES 7.8). Without, chunks are drawn at once.
+			// plugin hid is drawn by the old chunk, faded in (FO4-ENGINE-NOTES 7.8). Without, chunks are drawn at once,
+			// as under the loading menu, where the engine snaps every loaded cell's fades after a load (7.8).
 			const bool         fadeNodes = Settings::Get().chunkFadeNodes;
 			std::vector<float> fades;
 			for (const auto& bucket : a_job.buckets) {
 				for (const auto& chunk : bucket.chunks) {
-					if (!fadeNodes) {
+					if (!fadeNodes || a_loading) {
 						fades.push_back(1.0F);
 						continue;
 					}
@@ -1111,15 +1119,18 @@ namespace RC::Combine::Manager
 			}
 			// A root hidden whole is skipped by the query's test but still read in each of its three passes every frame:
 			// with ~25k of them the query took 8 ms a frame (run 13). It leaves the set while its chunks stand in.
+			// Under the loading menu the new cells' registrations are still queued and the set is the frame's to
+			// change (5.5d): TakeOutLoaded takes the roots out two ticks on.
 			std::unordered_set<const RE::NiAVObject*> carriedRoots;
 			for (const auto& hidden : carried) {
 				carriedRoots.insert(hidden.object.get());
 			}
 			for (auto& hidden : applied->hidden) {
 				if (hidden.object == hidden.root) {
-					hidden.unregistered = carriedRoots.erase(hidden.object.get()) > 0 || Engine::UnregisterIfDynamic(hidden.object.get());
+					hidden.unregistered = carriedRoots.erase(hidden.object.get()) > 0 || (!a_loading && Engine::UnregisterIfDynamic(hidden.object.get()));
 				}
 			}
+			applied->previsPending = a_loading;
 			for (auto& hidden : carried) {  // not hidden whole any more: back in, as Fallback would have
 				if (carriedRoots.contains(hidden.object.get())) {
 					Reregister(hidden);
@@ -1138,10 +1149,12 @@ namespace RC::Combine::Manager
 
 		// ---- jobs ----------------------------------------------------------------------------------------------
 
-		void ProcessJobs()
+		// a_loading: under the loading menu (LoadPass): no frame to spread the buffers over, and no frame to have drawn
+		// the probes; WatchProbes judges them once frames are drawn.
+		void ProcessJobs(bool a_loading = false)
 		{
 			const auto& settings = Settings::Get();
-			std::size_t createBudget = kCreateBytesPerFrame;
+			std::size_t createBudget = a_loading ? SIZE_MAX : kCreateBytesPerFrame;
 			for (auto it = g_jobs.begin(); it != g_jobs.end();) {
 				auto& job = **it;
 				if (!job.baked.load(std::memory_order_acquire)) {
@@ -1190,28 +1203,29 @@ namespace RC::Combine::Manager
 					continue;
 				}
 				state.building = false;
-				if (!StillValid(job) || !ProbesDrawn(state, job)) {
+				if (!StillValid(job) || (!a_loading && !ProbesDrawn(state, job))) {
 					ReleaseTriShapes(job);
 					MarkChanged(state);
 					++g_totals.discarded;
 					it = g_jobs.erase(it);
 					continue;
 				}
-				Apply(job, state);
+				Apply(job, state, a_loading);
 				ReleaseTriShapes(job);  // any left over (chunks that failed to apply)
 				it = g_jobs.erase(it);
 			}
 		}
 
-		void StartJobs()
+		// a_loading: under the loading menu (LoadPass): the load is done, so every cell at once, no settle.
+		void StartJobs(bool a_loading = false)
 		{
 			const auto& settings = Settings::Get();
 			const auto  start = Clock::now();
 			for (auto& [cell, state] : g_cells) {
-				if (!state.dirty || state.building || state.blind || g_frame - state.lastChange < settings.settleFrames) {
+				if (!state.dirty || state.building || state.blind || (!a_loading && g_frame - state.lastChange < settings.settleFrames)) {
 					continue;
 				}
-				if (Ms(start) > settings.gatherBudgetMs) {
+				if (!a_loading && Ms(start) > settings.gatherBudgetMs) {
 					break;
 				}
 				state.dirty = false;
@@ -1231,7 +1245,7 @@ namespace RC::Combine::Manager
 					Revert(state);  // nothing to combine any more
 					continue;
 				}
-				if (!EnsureProbes(state, *job)) {
+				if (!EnsureProbes(state, *job) && !a_loading) {
 					MarkChanged(state);  // a new probe, or one the last frame didn't draw: gather again after a settle
 					continue;
 				}
@@ -1405,13 +1419,18 @@ namespace RC::Combine::Manager
 			}
 		};
 
-		// Object (un)load events: handled at once on the game thread, queued from any other.
+		// Object (un)load events: handled at once on the game thread, queued from any other (and while a loading-menu
+		// pass on another thread holds the state).
 		class ObjectSink final : public RE::BSTEventSink<RE::TESObjectLoadedEvent>
 		{
 		public:
 			RE::BSEventNotifyControl ProcessEvent(const RE::TESObjectLoadedEvent& a_event, RE::BSTEventSource<RE::TESObjectLoadedEvent>*) override
 			{
+				std::unique_lock<std::recursive_timed_mutex> state;
 				if (GetCurrentThreadId() == g_mainThread.load(std::memory_order_relaxed)) {
+					state = std::unique_lock{ g_stateMutex, std::try_to_lock };
+				}
+				if (state) {
 					OnObject(a_event.formID, a_event.loaded);
 				} else {
 					std::scoped_lock lock{ g_eventMutex };
@@ -1818,12 +1837,75 @@ namespace RC::Combine::Manager
 			logger::info("game load: everything restored and forgotten");
 		}
 
+		// Roots hidden whole under the loading menu leave previs's dynamic objects two ticks on, once a frame's
+		// MultiCellVisibilityData::Update has taken in the new cells' queued registrations (FO4-ENGINE-NOTES 5.5d).
+		// Meanwhile the query skips them: they are AppCulled, or (owning collision) their meshes are.
+		void TakeOutLoaded()
+		{
+			for (auto& [cell, state] : g_cells) {
+				const auto& applied = state.applied;
+				if (!applied || !applied->previsPending || applied->fallback || g_frame < applied->frame + 2) {
+					continue;
+				}
+				applied->previsPending = false;
+				for (auto& hidden : applied->hidden) {
+					if (hidden.object == hidden.root && !hidden.unregistered) {
+						hidden.unregistered = Engine::UnregisterIfDynamic(hidden.object.get());
+					}
+				}
+			}
+		}
+
+		// TES::HideLoadingMenu, before the menu is told to close (Engine::InstallLoadingMenuHook): every attached cell
+		// is gathered, baked, created and applied while the menu still covers the screen, so the first frames draw
+		// chunks instead of every original. Runs on the caller's thread: the loader for a save load, when it has
+		// attached the cells and no game frame runs (FO4-ENGINE-NOTES 3, 7.15). The probes can't be judged before a
+		// frame is drawn: WatchProbes shows a cell's originals again if its probe stays unseen once frames run.
+		// Cells not done within iLoadWaitMs finish after the menu, the usual way.
+		void LoadPass(const char* a_caller)
+		{
+			const auto& settings = Settings::Get();
+			if (!settings.combineDuringLoad || !g_active || g_halted) {
+				return;
+			}
+			std::unique_lock lock{ g_stateMutex, std::defer_lock };
+			if (!lock.try_lock_for(std::chrono::milliseconds(500))) {
+				logger::warn("loading menu closing ({}, thread {}): the tick holds the state; combining after the menu", a_caller, GetCurrentThreadId());
+				return;
+			}
+			const auto start = Clock::now();
+			if (g_resetPending.exchange(false)) {
+				Reset();
+			}
+			PollCells();
+			DrainEvents();
+			// What the tick decides (workshop, previs without the query hook): the menu changes neither.
+			if (Paused() || (!g_previsHook && !g_cbroLoaded && Engine::PrevisActive())) {
+				return;
+			}
+			const auto applies = g_totals.applies;
+			StartJobs(true);
+			const auto gathered = Ms(start);
+			while (!g_jobs.empty() && Ms(start) < static_cast<double>(settings.loadWaitMs)) {
+				ProcessJobs(true);
+				if (!g_jobs.empty()) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				}
+			}
+			std::size_t combined = 0;
+			for (const auto& [cell, state] : g_cells) {
+				combined += state.applied ? 1 : 0;
+			}
+			logger::info("loading menu closing ({}, thread {}): {} of {} attached cells combined ({} applied now) in {:.0f} ms (gather {:.0f} ms){}",
+				a_caller, GetCurrentThreadId(), combined, g_cells.size(), g_totals.applies - applies, Ms(start), gathered,
+				g_jobs.empty() ? std::string{} : std::format(", {} still building: they finish after the menu", g_jobs.size()));
+		}
+
 		void Tick()
 		{
 			++g_frame;
 			if (g_frame == 1) {
 				g_mainThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
-				g_cbroLoaded = GetModuleHandleW(L"CBRO.dll") != nullptr;
 				logger::info("first frame tick (thread {}): precombines {}, previs {}, CBRO {}", GetCurrentThreadId(),
 					Engine::PrecombinesEnabled() ? "on" : "off", Engine::PrevisEnabled() ? "on" : "off", g_cbroLoaded ? "loaded" : "not loaded");
 			}
@@ -1834,6 +1916,7 @@ namespace RC::Combine::Manager
 			CheckSizing();
 			PollCells();
 			DrainEvents();
+			TakeOutLoaded();
 
 			if (settings.toggleHotkey) {
 				// Only while the game window has focus (a key pressed in another window doesn't count).
@@ -1902,6 +1985,10 @@ namespace RC::Combine::Manager
 		{
 			using func_t = void (*)(RE::PlayerCharacter*, float);
 			reinterpret_cast<func_t>(g_originalUpdate)(a_this, a_delta);
+			std::unique_lock lock{ g_stateMutex, std::try_to_lock };
+			if (!lock) {
+				return;  // a loading-menu pass on another thread (LoadPass)
+			}
 			const auto start = Clock::now();
 			try {
 				Tick();
@@ -1942,11 +2029,16 @@ namespace RC::Combine::Manager
 		} else {
 			logger::warn("game reset not hooked: F3 only swaps chunks and originals; precombines stay as set at startup");
 		}
+		if (Settings::Get().combineDuringLoad) {
+			const auto sites = Engine::InstallLoadingMenuHook(&LoadPass);
+			logger::info("TES::HideLoadingMenu hooked at {} call sites: cells are combined before the loading menu closes", sites);
+		}
 	}
 
 	void OnGameDataReady()
 	{
 		const auto& settings = Settings::Get();
+		g_cbroLoaded = GetModuleHandleW(L"CBRO.dll") != nullptr;  // every plugin is loaded by now; read before a load pass
 		g_configuredPrecombines = Engine::PrecombinesEnabled();
 		if (settings.disablePrecombines) {
 			if (Engine::PrecombinesEnabled()) {

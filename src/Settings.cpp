@@ -64,6 +64,8 @@ namespace RC
 		clusterSpread = std::clamp(ReadFloat(path, L"Combine", L"fClusterSpread", clusterSpread), 0.0F, 100.0F);
 		groupSize = ReadFloat(path, L"Combine", L"fGroupSize", groupSize);
 		groupSize = groupSize < 0.0F ? -1.0F : groupSize == 0.0F ? 0.0F : std::clamp(groupSize, 256.0F, 65536.0F);
+		combineDuringLoad = ReadBool(path, L"Combine", L"bCombineDuringLoad", combineDuringLoad);
+		loadWaitMs = std::clamp(ReadUInt(path, L"Combine", L"iLoadWaitMs", loadWaitMs), 0u, 60000u);
 
 		logCells = ReadBool(path, L"Debug", L"bLogCells", logCells);
 		watchdogRefsPerFrame = std::clamp(ReadUInt(path, L"Debug", L"iWatchdogRefsPerFrame", watchdogRefsPerFrame), 16u, 1u << 20);
@@ -71,9 +73,10 @@ namespace RC
 		logger::info(
 			"settings ({}): enabled {}, disablePrecombines {}, apply {}, toggleHotkey 0x{:X}, notify {}, "
 			"chunkSize {}, maxShapeRadius {}, minShapesPerChunk {}, settleFrames {}, gatherBudgetMs {}, chunkFadeNodes {}, parkHidden {}, "
-			"chunkGrowth {}, clusterSpread {}, groupSize {}, logCells {}, watchdogRefsPerFrame {}",
+			"chunkGrowth {}, clusterSpread {}, groupSize {}, combineDuringLoad {}, loadWaitMs {}, logCells {}, watchdogRefsPerFrame {}",
 			exists ? "RuntimeCombiner.ini" : "defaults, no RuntimeCombiner.ini",
 			enabled, disablePrecombines, apply, toggleHotkey, notify,
-			chunkSize, maxShapeRadius, minShapesPerChunk, settleFrames, gatherBudgetMs, chunkFadeNodes, parkHidden, chunkGrowth, clusterSpread, groupSize, logCells, watchdogRefsPerFrame);
+			chunkSize, maxShapeRadius, minShapesPerChunk, settleFrames, gatherBudgetMs, chunkFadeNodes, parkHidden, chunkGrowth, clusterSpread, groupSize,
+			combineDuringLoad, loadWaitMs, logCells, watchdogRefsPerFrame);
 	}
 }

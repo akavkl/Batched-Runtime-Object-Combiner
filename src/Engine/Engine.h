@@ -254,4 +254,10 @@ namespace RC::Engine
 	// is cleared and purged, before the next world loads, the one point where the precombine switch may change
 	// (FO4-ENGINE-NOTES 7.12). False when the site isn't the engine's own call.
 	[[nodiscard]] bool InstallGameResetHook(void (*a_after)());
+
+	// Wraps TES::HideLoadingMenu at the engine's call sites (save load, doors, fast travel, the frame's start;
+	// FO4-ENGINE-NOTES 7.15): a_before runs on the calling thread while the loading menu still covers the screen,
+	// before the menu is told to close and the fade-in from black starts. It gets the caller's name. Returns how
+	// many sites were the engine's own call and are now wrapped.
+	[[nodiscard]] std::uint32_t InstallLoadingMenuHook(void (*a_before)(const char* a_caller));
 }
