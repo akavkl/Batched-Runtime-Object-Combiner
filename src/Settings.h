@@ -19,6 +19,7 @@ namespace RC
 		std::uint32_t settleFrames{ 45 };         // frames without 3D changes in a cell before it is (re)combined
 		float         gatherBudgetMs{ 2.0F };     // main-thread time per frame for collecting cells
 		bool          chunkFadeNodes{ true };     // each chunk under its own BSFadeNode, fading like its originals; off: in the container
+		bool          chunkMeshLOD{ true };       // chunks keep their members' mesh LOD levels (with chunkFadeNodes); off: full detail
 		bool          parkHidden{ true };         // roots hidden whole wait under a hidden node the scene walk never visits
 		float         chunkGrowth{ 2048.0F };     // beyond this distance from the player chunks grow in proportion (x8 at most); 0 = off
 		float         clusterSpread{ 0.0F };      // a chunk reaches at most this x its members' volume radius (beyond fChunkSize / 4); 0 = off
@@ -31,6 +32,7 @@ namespace RC
 		// [Debug]
 		bool          logCells{ true };              // one line per combined cell
 		std::uint32_t watchdogRefsPerFrame{ 512 };  // combined references re-checked per frame
+		bool          probes{ false };              // measurement probes: GPU probe, census, chunk audit, previs line, self-check
 
 		void Load();
 

@@ -5,6 +5,7 @@
 
 #include "Combine/Vertex.h"
 
+#include <array>
 #include <span>
 #include <vector>
 
@@ -20,6 +21,9 @@ namespace RC::Bake
 		std::uint32_t        vertexCount{ 0 };
 		const std::uint16_t* indices{ nullptr };
 		std::uint32_t        triangleCount{ 0 };
+		// A BSMeshLODTriShape's segments: its first lodSizes[0] triangles draw at mesh-LOD level 1, the next
+		// lodSizes[1] join at level 2, the rest at level 3 (FO4-ENGINE-NOTES 7.11). All zero: one segment, always drawn.
+		std::uint32_t        lodSizes[3]{};
 		Vertex::Affine       toWorld;     // model space -> world space
 		float                center[3]{};  // world bound
 		float                radius{ 0.0F };
@@ -37,9 +41,18 @@ namespace RC::Bake
 		std::vector<std::uint16_t> indices;
 		std::uint32_t              vertexCount{ 0 };
 		std::uint32_t              triangleCount{ 0 };
+		// The indices are in segment order: every member's level-1 triangles, then every member's level-2 additions,
+		// then the rest. A BSMeshLODTriShape with these sizes draws each member at its own level's detail.
+		std::uint32_t              lodSizes[3]{};
 		float                      boundCenter[3]{};  // relative to origin
 		float                      boundRadius{ 0.0F };
 		std::vector<std::uint32_t> baked;  // members actually written (one whose data failed the checks is left out)
+		// Self-check (run 40, objects piled up): members whose written vertices lie off their world bound (box centre
+		// beyond 2 x radius + 64 from the bound centre, or a box half diagonal beyond that), and the first of them.
+		std::uint32_t strays{ 0 };
+		std::uint32_t firstStray{ 0 };     // index into the bucket's members
+		float         strayOffset{ 0.0F };  // its vertex box centre's distance from its bound centre
+		float         strayExtent{ 0.0F };  // its vertex box's half diagonal
 		// One member drawn as it is (a clone of its mesh sharing its data): no vertex data written. It still
 		// replaces its original, so the reference can be hidden whole.
 		bool solo{ false };
@@ -69,6 +82,9 @@ namespace RC::Bake
 
 	// One solo chunk per member, whatever its data: members that can't merge, drawn by clones of their meshes.
 	[[nodiscard]] std::vector<Chunk> Solos(std::span<const Member> a_members);
+
+	// A member's three segments: its lodSizes when they add up to its triangles, else all in the first.
+	[[nodiscard]] std::array<std::uint32_t, 3> Segments(const Member& a_member) noexcept;
 
 	// Writes the chunk's data: the members' vertices (a_from) in the chunk's format (a_to, Vertex::Convertible).
 	// False when fewer than a_minMembers members could be written. A solo chunk only gets baked = members.

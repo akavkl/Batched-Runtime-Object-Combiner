@@ -1,5 +1,6 @@
 #include "Engine/Engine.h"
 
+#include <d3d11.h>
 #include <intrin.h>
 #include <unordered_set>
 
@@ -43,6 +44,19 @@ namespace RC::Engine
 		// The loading menu closes in TES::HideLoadingMenu (FO4-ENGINE-NOTES 7.15).
 		constexpr std::uint64_t kHideLoadingMenuID = 874976;   // TES::HideLoadingMenu                     0x1400FB360
 		constexpr std::size_t   kCanMergeSlot = 0x31;          // BSShaderProperty::CanMerge(BSShaderProperty*)
+		// A reference's placement (FO4-ENGINE-NOTES 7.16).
+		constexpr std::uint64_t kEulerXYZID = 124665;          // NiMatrix3::FromEulerAnglesXYZ(x, y, z)    0x141B90DA0
+		constexpr std::uint64_t kRefScaleID = 911188;          // TESObjectREFR::GetScale                   0x1403F8540
+		// A model's pose (FO4-ENGINE-NOTES 7.16).
+		constexpr std::uint64_t kPoseUpdateID = 878785;        // NiTransformController::Update             0x141C26390
+		constexpr std::size_t   kPoseUpdateSlot = 0x2A;        //   its vtable slot (+0x150)
+		constexpr std::size_t   kControllerStopSlot = 0x29;    // NiTimeController::Stop (+0x148): clears the active flag
+		constexpr std::uint16_t kControllerActive = 0x8;
+		constexpr std::uint16_t kControllerManaged = 0x20;     // Update poses whatever the active flag says
+		constexpr std::uint32_t kTargetMoved = 0x100000;       // NiUpdateData flag the pose sets when it writes
+		// The renderer context a thread draws with (FO4-ENGINE-NOTES 3).
+		constexpr std::uint64_t kTlsIndexID = 842564;          // Fallout4.exe's _tls_index                 0x1467347B4
+		constexpr std::size_t   kTlsRendererContext = 0xB18;   //   its TLS block + this: holder, first qword ID3D11DeviceContext*
 
 		// TES and the exterior cell grid (layouts from CBRO's Compat.h).
 		struct GridCellArray
@@ -83,6 +97,8 @@ namespace RC::Engine
 			std::uintptr_t fadeMults{ 0 };
 			std::uintptr_t fadeDistMult{ 0 };
 			std::uintptr_t fadingOn{ 0 };
+			std::uintptr_t eulerXYZ{ 0 };
+			std::uintptr_t refScale{ 0 };
 			std::uintptr_t previsQuerySite{ 0 };
 			std::uintptr_t previsQuery{ 0 };
 			std::uintptr_t visibility{ 0 };
@@ -95,6 +111,7 @@ namespace RC::Engine
 			std::uintptr_t fadeNodeVtable{ 0 };
 			std::uintptr_t lightingShaderVtable{ 0 };
 			std::uintptr_t effectShaderVtable{ 0 };
+			std::uintptr_t transformControllerVtable{ 0 };
 		};
 		Addresses g;
 
@@ -147,6 +164,8 @@ namespace RC::Engine
 		g.fadeMults = Resolve(kFadeMultsID, "fade multipliers", ok);
 		g.fadeDistMult = Resolve(kFadeDistMultID, "fDistanceMultiplier", ok);
 		g.fadingOn = Resolve(kFadingOnID, "fading enabled", ok);
+		g.eulerXYZ = Resolve(kEulerXYZID, "NiMatrix3::FromEulerAnglesXYZ", ok);
+		g.refScale = Resolve(kRefScaleID, "TESObjectREFR::GetScale", ok);
 		// Optional: without them chunks are not drawn while previs draws the main view (the originals are shown then).
 		bool feed = true;
 		const auto renderPreUI = Resolve(kRenderPreUIID, "Render_PreUI", feed);
@@ -162,7 +181,32 @@ namespace RC::Engine
 		g.fadeNodeVtable = VtableOf(RE::VTABLE::BSFadeNode, "BSFadeNode", ok);
 		g.lightingShaderVtable = VtableOf(RE::VTABLE::BSLightingShaderProperty, "BSLightingShaderProperty", ok);
 		g.effectShaderVtable = VtableOf(RE::VTABLE::BSEffectShaderProperty, "BSEffectShaderProperty", ok);
+		g.transformControllerVtable = VtableOf(RE::VTABLE::NiTransformController, "NiTransformController", ok);
 		return ok;
+	}
+
+	bool PosedByOwnModel(const RE::NiAVObject* a_root) noexcept
+	{
+		const void*   controller = a_root->controllers.get();
+		std::uint32_t count = 0;
+		for (; controller; controller = *Field<const void* const>(controller, Offset::kControllerNext)) {
+			if (VtableOfObject(controller) != g.transformControllerVtable || *Field<const void* const>(controller, Offset::kControllerTarget) != a_root ||
+				++count > 8) {
+				return false;
+			}
+		}
+		return count != 0;
+	}
+
+	RE::NiTransform Placement(const RE::TESObjectREFR* a_ref)
+	{
+		RE::NiTransform placement;
+		using euler_t = void (*)(RE::NiMatrix3*, float, float, float);
+		reinterpret_cast<euler_t>(g.eulerXYZ)(&placement.rotate, a_ref->data.angle.x, a_ref->data.angle.y, a_ref->data.angle.z);
+		placement.translate = RE::NiPoint3{ a_ref->data.location.x, a_ref->data.location.y, a_ref->data.location.z };
+		using scale_t = float (*)(const RE::TESObjectREFR*);
+		placement.scale = reinterpret_cast<scale_t>(g.refScale)(a_ref);
+		return placement;
 	}
 
 	bool IsExactTriShape(const RE::NiAVObject* a_object) noexcept
@@ -577,18 +621,61 @@ namespace RC::Engine
 		return extras ? extras->GetByType(static_cast<RE::EXTRA_DATA_TYPE>(kCombinedRefsExtra)) : nullptr;
 	}
 
+	namespace
+	{
+		// ExtraCombinedRefs +0x18: BSTSet<u32 formID>, CommonLibF4's BSTScatterTable layout (capacity +0x24,
+		// sentinel +0x30, entries +0x40: what TESObjectCELL::AddReference reads, FO4-ENGINE-NOTES 7.12).
+		[[nodiscard]] const RE::BSTSet<std::uint32_t>* CombinedRefSet(const void* a_combinedRefs) noexcept
+		{
+			return reinterpret_cast<const RE::BSTSet<std::uint32_t>*>(static_cast<const std::byte*>(a_combinedRefs) + 0x18);
+		}
+
+		[[nodiscard]] std::size_t CombinedRefCount(const void* a_combinedRefs) noexcept
+		{
+			__try {
+				return CombinedRefSet(a_combinedRefs)->size();
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+
+		[[nodiscard]] std::size_t CopyCombinedRefs(const void* a_combinedRefs, std::uint32_t* a_out, std::size_t a_capacity) noexcept
+		{
+			__try {
+				std::size_t count = 0;
+				for (const auto formID : *CombinedRefSet(a_combinedRefs)) {
+					if (count == a_capacity) {
+						break;
+					}
+					a_out[count++] = formID;
+				}
+				return count;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+	}
+
 	bool InCombinedRefs(const void* a_combinedRefs, std::uint32_t a_formID) noexcept
 	{
 		if (!a_combinedRefs) {
 			return false;
 		}
 		__try {
-			// ExtraCombinedRefs +0x18: BSTSet<u32 formID>, CommonLibF4's BSTScatterTable layout (capacity +0x24,
-			// sentinel +0x30, entries +0x40: what TESObjectCELL::AddReference reads, FO4-ENGINE-NOTES 7.12).
-			return reinterpret_cast<const RE::BSTSet<std::uint32_t>*>(static_cast<const std::byte*>(a_combinedRefs) + 0x18)->contains(a_formID);
+			return CombinedRefSet(a_combinedRefs)->contains(a_formID);
 		} __except (EXCEPTION_EXECUTE_HANDLER) {
 			return false;
 		}
+	}
+
+	void CombinedRefIDs(const void* a_combinedRefs, std::vector<std::uint32_t>& a_out)
+	{
+		if (!a_combinedRefs) {
+			return;
+		}
+		const auto start = a_out.size();
+		a_out.resize(start + CombinedRefCount(a_combinedRefs));
+		a_out.resize(start + CopyCombinedRefs(a_combinedRefs, a_out.data() + start, a_out.size() - start));
 	}
 
 	bool PrecombinesEnabled() noexcept
@@ -791,7 +878,7 @@ namespace RC::Engine
 		// One trampoline for every call-site hook (allocating again would replace it).
 		F4SE::Trampoline& Trampoline()
 		{
-			static const bool allocated = (F4SE::AllocTrampoline(256), true);
+			static const bool allocated = (F4SE::AllocTrampoline(512), true);
 			(void)allocated;
 			return F4SE::GetTrampoline();
 		}
@@ -874,5 +961,563 @@ namespace RC::Engine
 			++hooked;
 		}
 		return hooked;
+	}
+
+	namespace
+	{
+		// The frame in contiguous segments, switched at four Render_PreUI calls: before the cull (+0x16A), around the
+		// pre-pass (+0x17F), around the shadow maps and lights (+0x1BF), around forward (+0x1C9). The composite (+0x1C4)
+		// is the only call between the last two (FO4-ENGINE-NOTES 4.1). These calls take no arguments; the thunks still
+		// forward the four integer argument registers and the return value.
+		using StageFunc = std::uintptr_t (*)(std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t);
+		struct StageSite
+		{
+			std::size_t offset;
+			GpuStage    before;  // the segment that starts when the call starts
+			GpuStage    after;   // ... and when it returns (kGpuStageCount: none)
+		};
+		constexpr std::array<StageSite, 4> kStageSites{ { { 0x16A, kGpuCull, kGpuStageCount }, { 0x17F, kGpuPrePass, kGpuAfterPrePass },
+			{ 0x1BF, kGpuLights, kGpuComposite }, { 0x1C9, kGpuForward, kGpuOutside } } };
+		constexpr std::array<const char*, kGpuStageCount> kStageNames{ "outside Render_PreUI (post-processing, UI, other passes)",
+			"cull to pre-pass", "pre-pass", "after the pre-pass", "shadow maps and lights", "composite", "forward" };
+		constexpr std::size_t kQueryRing = 8;  // queries per segment in flight; results are read a few frames late
+
+		enum class QueryState : std::uint8_t
+		{
+			kIdle,
+			kActive,  // between Begin and End
+			kIssued   // ended, result not read yet
+		};
+		struct Segment
+		{
+			std::array<ID3D11Query*, kQueryRing> queries{};
+			std::array<QueryState, kQueryRing>   states{};
+			std::size_t                          next{ 0 };
+		};
+		std::array<Segment, kGpuStageCount>       g_segments;
+		std::array<StageFunc, kStageSites.size()> g_stageOriginals{};
+		std::size_t                               g_activeSegment{ kGpuStageCount };  // whose query is between Begin and End
+		std::size_t                               g_activeSlot{ 0 };
+		std::uintptr_t                            g_tlsIndex{ 0 };
+		ID3D11DeviceContext*                      g_queryContext{ nullptr };  // the context the queries belong to
+		bool                                      g_gpuFailed{ false };
+		std::mutex                                g_gpuLock;
+		std::array<GpuStageStats, kGpuStageCount> g_gpuStats{};
+		std::atomic<std::uint32_t>                g_renderThread{ 0 };
+
+		// GPU timestamps at the seven boundaries of a frame (cull begin, pre-pass begin and end, lights begin and end,
+		// forward begin and end) inside one disjoint query, so each segment's GPU time is the difference of two.
+		// "Outside" runs from one frame's forward end to the next frame's cull begin.
+		constexpr std::size_t kStamps = 7;
+		struct FrameStamps
+		{
+			ID3D11Query*                       disjoint{ nullptr };
+			std::array<ID3D11Query*, kStamps>  stamps{};
+			std::uint32_t                      issued{ 0 };  // bit per stamp ended this frame
+			bool                               pending{ false };  // disjoint ended, results not read yet
+			bool                               open{ false };     // disjoint begun, not yet ended
+			std::uint64_t                      frame{ 0 };
+		};
+		std::array<FrameStamps, kQueryRing> g_frames;
+		std::size_t                         g_frameSlot{ kQueryRing };  // the slot of the frame being stamped
+		std::uint64_t                       g_frameNumber{ 0 };
+		std::uint64_t                       g_lastReadFrame{ 0 };
+		std::uint64_t                       g_lastForwardEnd{ 0 };  // its stamp 6, in its disjoint's ticks
+		std::uint64_t                       g_lastFrequency{ 0 };
+		constexpr std::array<std::size_t, kStamps> kStampSegments{ kGpuCull, kGpuPrePass, kGpuAfterPrePass, kGpuLights, kGpuComposite,
+			kGpuForward, kGpuOutside };  // the segment each stamp starts
+
+		// The image-space effects DrawWorld::DeferredComposite renders (FO4-ENGINE-NOTES 4.1): [[161743] + 0x18] is the
+		// effect array; each entry is the effect's interface at +0x118, called through its vtable's slot 1.
+		constexpr std::uint64_t kImageSpaceManagerID = 161743;
+		constexpr std::array<std::size_t, kCompositeEffects> kEffectSlots{ 0x260, 0x618, 0x620, 0x628, 0x630 };
+		using EffectFunc = std::uintptr_t (*)(void*, std::uintptr_t, std::uintptr_t, std::uintptr_t);
+		struct EffectProbe
+		{
+			void*                     object{ nullptr };     // the interface pointer the composite calls
+			std::uintptr_t            vtable{ 0 };
+			EffectFunc                original{ nullptr };
+			std::array<ID3D11Query*, kQueryRing> before{};   // per frame slot
+			std::array<ID3D11Query*, kQueryRing> after{};
+			std::array<std::uint8_t, kQueryRing> issued{};   // bit 0 before, bit 1 after
+			char                      name[96]{};
+			double                    gpuMs{ 0.0 };
+			std::uint64_t             timed{ 0 };
+		};
+		std::array<EffectProbe, kCompositeEffects> g_effects;
+		bool                                       g_effectsHooked{ false };
+
+		// The context this thread's draws go to, [TLS block + 0xB18] (FO4-ENGINE-NOTES 3), used only while it is
+		// RendererData's immediate context (the one CBRO's queries run on).
+		[[nodiscard]] ID3D11DeviceContext* RendererContext() noexcept
+		{
+			const auto index = *reinterpret_cast<const std::uint32_t*>(g_tlsIndex);
+			const auto blocks = reinterpret_cast<std::byte* const*>(__readgsqword(0x58));
+			const auto data = RE::BSGraphics::RendererData::GetSingleton();
+			if (!blocks || !blocks[index] || !data) {
+				return nullptr;
+			}
+			const auto context = *reinterpret_cast<ID3D11DeviceContext* const*>(blocks[index] + kTlsRendererContext);
+			return context && context == reinterpret_cast<ID3D11DeviceContext*>(data->context) ? context : nullptr;
+		}
+
+		// Creates every segment's queries on the context's device the first time (main thread, inside the render).
+		[[nodiscard]] bool EnsureQueries(ID3D11DeviceContext* a_context) noexcept
+		{
+			if (g_queryContext) {
+				return g_queryContext == a_context;
+			}
+			ID3D11Device* device = nullptr;
+			a_context->GetDevice(&device);
+			if (!device) {
+				g_gpuFailed = true;
+				return false;
+			}
+			D3D11_QUERY_DESC desc{ D3D11_QUERY_PIPELINE_STATISTICS, 0 };
+			for (auto& segment : g_segments) {
+				for (auto& query : segment.queries) {
+					if (FAILED(device->CreateQuery(&desc, &query))) {
+						g_gpuFailed = true;
+					}
+				}
+			}
+			const D3D11_QUERY_DESC disjointDesc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+			const D3D11_QUERY_DESC stampDesc{ D3D11_QUERY_TIMESTAMP, 0 };
+			for (auto& frame : g_frames) {
+				if (FAILED(device->CreateQuery(&disjointDesc, &frame.disjoint))) {
+					g_gpuFailed = true;
+				}
+				for (auto& stamp : frame.stamps) {
+					if (FAILED(device->CreateQuery(&stampDesc, &stamp))) {
+						g_gpuFailed = true;
+					}
+				}
+			}
+			for (auto& effect : g_effects) {
+				for (std::size_t i = 0; i < kQueryRing; ++i) {
+					if (FAILED(device->CreateQuery(&stampDesc, &effect.before[i])) || FAILED(device->CreateQuery(&stampDesc, &effect.after[i]))) {
+						g_gpuFailed = true;
+					}
+				}
+			}
+			device->Release();
+			if (g_gpuFailed) {
+				logger::error("GPU probe: pipeline-statistics queries could not be created; nothing is measured");
+				return false;
+			}
+			g_queryContext = a_context;
+			return true;
+		}
+
+		// Adds every ended query whose result is ready (never waits).
+		void Harvest() noexcept
+		{
+			for (std::size_t s = 0; s < kGpuStageCount; ++s) {
+				auto& segment = g_segments[s];
+				auto& stats = g_gpuStats[s];
+				for (std::size_t i = 0; i < kQueryRing; ++i) {
+					if (segment.states[i] != QueryState::kIssued) {
+						continue;
+					}
+					D3D11_QUERY_DATA_PIPELINE_STATISTICS data{};
+					if (g_queryContext->GetData(segment.queries[i], &data, sizeof(data), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+						continue;
+					}
+					segment.states[i] = QueryState::kIdle;
+					++stats.frames;
+					stats.iaPrimitives += data.IAPrimitives;
+					stats.cPrimitives += data.CPrimitives;
+					stats.vsInvocations += data.VSInvocations;
+					stats.psInvocations += data.PSInvocations;
+					stats.csInvocations += data.CSInvocations;
+				}
+			}
+
+			// Timestamped frames, oldest first: a frame is read only when its disjoint query and all seven stamps are.
+			for (std::size_t n = 0; n < kQueryRing; ++n) {
+				FrameStamps* oldest = nullptr;
+				for (auto& frame : g_frames) {
+					if (frame.pending && (!oldest || frame.frame < oldest->frame)) {
+						oldest = &frame;
+					}
+				}
+				if (!oldest) {
+					break;
+				}
+				D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+				if (g_queryContext->GetData(oldest->disjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+					break;
+				}
+				std::array<std::uint64_t, kStamps> t{};
+				bool                               ready = true;
+				for (std::size_t i = 0; i < kStamps && ready; ++i) {
+					ready = !(oldest->issued & (1u << i)) ||
+					        g_queryContext->GetData(oldest->stamps[i], &t[i], sizeof(t[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+				}
+				const auto                                         slot = static_cast<std::size_t>(oldest - g_frames.data());
+				std::array<std::array<std::uint64_t, 2>, kCompositeEffects> e{};
+				for (std::size_t i = 0; i < kCompositeEffects && ready; ++i) {
+					const auto& effect = g_effects[i];
+					ready = (!(effect.issued[slot] & 1) ||
+							 g_queryContext->GetData(effect.before[slot], &e[i][0], sizeof(e[i][0]), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) &&
+					        (!(effect.issued[slot] & 2) ||
+							 g_queryContext->GetData(effect.after[slot], &e[i][1], sizeof(e[i][1]), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK);
+				}
+				if (!ready) {
+					break;
+				}
+				oldest->pending = false;
+				if (disjoint.Disjoint || !disjoint.Frequency || oldest->issued != (1u << kStamps) - 1) {
+					g_lastReadFrame = 0;
+					continue;
+				}
+				const double msPerTick = 1000.0 / static_cast<double>(disjoint.Frequency);
+				for (std::size_t i = 0; i < kCompositeEffects; ++i) {
+					auto& effect = g_effects[i];
+					if (effect.issued[slot] == 3 && e[i][1] >= e[i][0]) {
+						effect.gpuMs += static_cast<double>(e[i][1] - e[i][0]) * msPerTick;
+						++effect.timed;
+					}
+				}
+				for (std::size_t i = 0; i + 1 < kStamps; ++i) {
+					auto& stats = g_gpuStats[kStampSegments[i]];
+					stats.gpuMs += static_cast<double>(t[i + 1] - t[i]) * msPerTick;
+					++stats.timed;
+				}
+				if (g_lastReadFrame && g_lastReadFrame + 1 == oldest->frame && g_lastFrequency == disjoint.Frequency && t[0] > g_lastForwardEnd) {
+					auto& stats = g_gpuStats[kGpuOutside];
+					stats.gpuMs += static_cast<double>(t[0] - g_lastForwardEnd) * msPerTick;
+					++stats.timed;
+				}
+				g_lastReadFrame = oldest->frame;
+				g_lastForwardEnd = t[kStamps - 1];
+				g_lastFrequency = disjoint.Frequency;
+			}
+		}
+
+		// Ends stamp a_index of the frame being stamped; stamp 0 starts a frame (main thread, inside the render).
+		void Stamp(ID3D11DeviceContext* a_context, std::size_t a_index) noexcept
+		{
+			if (a_index == 0) {
+				if (g_frameSlot < kQueryRing && g_frames[g_frameSlot].open) {
+					// The last frame never reached its forward end: close it, it won't be counted.
+					g_queryContext->End(g_frames[g_frameSlot].disjoint);
+					g_frames[g_frameSlot].open = false;
+					g_frames[g_frameSlot].pending = true;
+				}
+				++g_frameNumber;
+				g_frameSlot = kQueryRing;
+				for (std::size_t i = 0; i < kQueryRing; ++i) {
+					if (!g_frames[i].pending && !g_frames[i].open) {
+						g_frameSlot = i;
+						break;
+					}
+				}
+				if (g_frameSlot == kQueryRing) {
+					return;
+				}
+				auto& frame = g_frames[g_frameSlot];
+				frame.frame = g_frameNumber;
+				frame.issued = 0;
+				frame.open = true;
+				for (auto& effect : g_effects) {
+					effect.issued[g_frameSlot] = 0;
+				}
+				a_context->Begin(frame.disjoint);
+			}
+			if (g_frameSlot >= kQueryRing || !g_frames[g_frameSlot].open) {
+				return;
+			}
+			auto& frame = g_frames[g_frameSlot];
+			a_context->End(frame.stamps[a_index]);
+			frame.issued |= 1u << a_index;
+			if (a_index == kStamps - 1) {
+				a_context->End(frame.disjoint);
+				frame.open = false;
+				frame.pending = true;
+			}
+		}
+
+		// Stamp before or after composite effect a_effect in the frame being stamped (main thread, inside the render).
+		void EffectStamp(std::size_t a_effect, bool a_after) noexcept
+		{
+			if (!g_queryContext || g_frameSlot >= kQueryRing || !g_frames[g_frameSlot].open ||
+				GetCurrentThreadId() != g_renderThread.load(std::memory_order_relaxed)) {
+				return;
+			}
+			auto& effect = g_effects[a_effect];
+			g_queryContext->End(a_after ? effect.after[g_frameSlot] : effect.before[g_frameSlot]);
+			effect.issued[g_frameSlot] |= a_after ? 2 : 1;
+		}
+
+		std::uintptr_t EffectThunk(void* a_this, std::uintptr_t a_2, std::uintptr_t a_3, std::uintptr_t a_4)
+		{
+			// Every vtable patched here is in g_effects with its original; the object decides whether it is timed.
+			const auto  vtable = *static_cast<const std::uintptr_t*>(a_this);
+			EffectFunc  original = nullptr;
+			std::size_t index = kCompositeEffects;
+			for (std::size_t i = 0; i < kCompositeEffects; ++i) {
+				if (g_effects[i].vtable == vtable && g_effects[i].original) {
+					original = g_effects[i].original;
+				}
+				if (g_effects[i].object == a_this) {
+					index = i;
+				}
+			}
+			if (index < kCompositeEffects) {
+				std::scoped_lock lock(g_gpuLock);
+				EffectStamp(index, false);
+			}
+			const auto result = original(a_this, a_2, a_3, a_4);
+			if (index < kCompositeEffects) {
+				std::scoped_lock lock(g_gpuLock);
+				EffectStamp(index, true);
+			}
+			return result;
+		}
+
+		// The class name in an object's RTTI (its vtable's complete-object locator), or empty.
+		void CopyTypeName(const void* a_object, char* a_out, std::size_t a_size) noexcept
+		{
+			a_out[0] = '\0';
+			__try {
+				const auto vtable = *static_cast<const std::uintptr_t*>(a_object);
+				const auto locator = *reinterpret_cast<const std::uintptr_t*>(vtable - 8);
+				const auto descriptor = *reinterpret_cast<const std::uint32_t*>(locator + 0xC);
+				const auto name = reinterpret_cast<const char*>(REL::Module::get().base() + descriptor + 0x10);
+				std::size_t i = 0;
+				for (; i + 1 < a_size && name[i]; ++i) {
+					a_out[i] = name[i];
+				}
+				a_out[i] = '\0';
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				a_out[0] = '\0';
+			}
+		}
+
+		// Patches slot 1 of each composite effect's interface vtable once, the first time the composite is reached
+		// (main thread, before the composite runs; it is the only caller).
+		void HookCompositeEffects() noexcept
+		{
+			const auto manager = *reinterpret_cast<const std::uintptr_t*>(OG(kImageSpaceManagerID).address());
+			const auto effects = manager ? *reinterpret_cast<const std::uintptr_t*>(manager + 0x18) : 0;
+			if (!effects) {
+				return;
+			}
+			g_effectsHooked = true;
+			for (std::size_t i = 0; i < kCompositeEffects; ++i) {
+				auto&      effect = g_effects[i];
+				const auto object = *reinterpret_cast<void* const*>(effects + kEffectSlots[i]);
+				if (!object) {
+					continue;
+				}
+				effect.object = object;
+				effect.vtable = *static_cast<const std::uintptr_t*>(object);
+				CopyTypeName(object, effect.name, sizeof(effect.name));
+				for (std::size_t j = 0; j < i; ++j) {
+					if (g_effects[j].vtable == effect.vtable) {
+						effect.original = g_effects[j].original;
+					}
+				}
+				if (!effect.original) {
+					effect.original = *reinterpret_cast<const EffectFunc*>(effect.vtable + 8);
+					REL::safe_write(effect.vtable + 8, reinterpret_cast<std::uintptr_t>(&EffectThunk));
+				}
+			}
+		}
+
+		// Ends the running segment's query and starts a_next's, with stamp a_stamp between them (main thread, inside
+		// the render).
+		void SwitchSegment(std::size_t a_next, std::size_t a_stamp) noexcept
+		{
+			if (g_gpuFailed || a_next >= kGpuStageCount) {
+				return;
+			}
+			const auto       context = RendererContext();
+			std::scoped_lock lock(g_gpuLock);
+			if (context && context == g_queryContext) {
+				Stamp(context, a_stamp);
+				if (a_next == kGpuComposite && !g_effectsHooked) {
+					HookCompositeEffects();
+				}
+			}
+			if (g_activeSegment < kGpuStageCount) {
+				auto& segment = g_segments[g_activeSegment];
+				g_queryContext->End(segment.queries[g_activeSlot]);
+				segment.states[g_activeSlot] = QueryState::kIssued;
+				g_activeSegment = kGpuStageCount;
+			}
+			if (!context || !EnsureQueries(context)) {
+				++g_gpuStats[a_next].skipped;
+				return;
+			}
+			Harvest();
+			auto&      segment = g_segments[a_next];
+			const auto slot = segment.next;
+			if (segment.states[slot] != QueryState::kIdle) {
+				++g_gpuStats[a_next].skipped;
+				return;
+			}
+			segment.states[slot] = QueryState::kActive;
+			segment.next = (slot + 1) % kQueryRing;
+			g_activeSegment = a_next;
+			g_activeSlot = slot;
+			context->Begin(segment.queries[slot]);
+		}
+
+		template <std::size_t I>
+		std::uintptr_t StageThunk(std::uintptr_t a_1, std::uintptr_t a_2, std::uintptr_t a_3, std::uintptr_t a_4)
+		{
+			g_renderThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+			// Stamps: site 0 before = 0; sites 1-3 before = 2I - 1, after = 2I.
+			SwitchSegment(kStageSites[I].before, I == 0 ? 0 : 2 * I - 1);
+			const auto result = g_stageOriginals[I](a_1, a_2, a_3, a_4);
+			SwitchSegment(kStageSites[I].after, 2 * I);
+			return result;
+		}
+
+		constexpr std::array<StageFunc, kStageSites.size()> kStageThunks{ &StageThunk<0>, &StageThunk<1>, &StageThunk<2>, &StageThunk<3> };
+	}
+
+	std::uint32_t InstallGpuStatsProbe()
+	{
+		bool       ok = true;
+		const auto renderPreUI = Resolve(kRenderPreUIID, "Render_PreUI", ok);
+		g_tlsIndex = Resolve(kTlsIndexID, "_tls_index", ok);
+		if (!ok) {
+			return 0;
+		}
+		// All or nothing: a missing boundary would merge two segments.
+		for (const auto& entry : kStageSites) {
+			if (*reinterpret_cast<const std::uint8_t*>(renderPreUI + entry.offset) != 0xE8) {
+				logger::warn("GPU probe: Render_PreUI+0x{:X} is not a call (byte {:02X}); nothing is measured", entry.offset,
+					*reinterpret_cast<const std::uint8_t*>(renderPreUI + entry.offset));
+				return 0;
+			}
+		}
+		for (std::size_t i = 0; i < kStageSites.size(); ++i) {
+			g_stageOriginals[i] = reinterpret_cast<StageFunc>(Trampoline().write_call<5>(renderPreUI + kStageSites[i].offset, kStageThunks[i]));
+		}
+		return static_cast<std::uint32_t>(kStageSites.size());
+	}
+
+	std::array<GpuStageStats, kGpuStageCount> TakeGpuStats() noexcept
+	{
+		std::scoped_lock lock(g_gpuLock);
+		return std::exchange(g_gpuStats, {});
+	}
+
+	std::array<CompositeEffectStats, kCompositeEffects> TakeCompositeEffects() noexcept
+	{
+		std::scoped_lock                                     lock(g_gpuLock);
+		std::array<CompositeEffectStats, kCompositeEffects> out{};
+		for (std::size_t i = 0; i < kCompositeEffects; ++i) {
+			auto& effect = g_effects[i];
+			std::ranges::copy(effect.name, out[i].name);
+			out[i].gpuMs = std::exchange(effect.gpuMs, 0.0);
+			out[i].timed = std::exchange(effect.timed, 0);
+		}
+		return out;
+	}
+
+	const char* GpuStageName(std::size_t a_stage) noexcept
+	{
+		return a_stage < kGpuStageCount ? kStageNames[a_stage] : "?";
+	}
+
+	namespace
+	{
+		using PoseUpdateFunc = void (*)(void*, void*);
+		PoseUpdateFunc g_poseOriginal{ nullptr };
+		bool (*g_poseHold)(const RE::TESObjectREFR*) { nullptr };
+		std::atomic<std::uint32_t> g_poseHeld{ 0 };
+		std::atomic<std::uint32_t> g_poseMoved{ 0 };
+
+		[[nodiscard]] bool Near(const RE::NiTransform& a_a, const RE::NiTransform& a_b) noexcept
+		{
+			for (int row = 0; row < 3; ++row) {
+				for (int column = 0; column < 3; ++column) {
+					if (std::abs(a_a.rotate.entry[row].pt[column] - a_b.rotate.entry[row].pt[column]) > 1e-4F) {
+						return false;
+					}
+				}
+			}
+			return a_a.translate.GetDistance(a_b.translate) <= 0.01F && std::abs(a_a.scale - a_b.scale) <= 1e-4F * std::abs(a_b.scale);
+		}
+
+		[[nodiscard]] bool UnrotatedUnscaled(const RE::NiTransform& a_world) noexcept
+		{
+			RE::NiTransform identity;
+			identity.MakeIdentity();
+			identity.translate = a_world.translate;
+			return Near(a_world, identity);
+		}
+
+		// The hold (see InstallPoseHook). No C++ object lives in this frame: the SEH guard covers the reads of engine
+		// objects on an animation job's thread.
+		[[nodiscard]] bool HoldPose(void* a_controller, void* a_data) noexcept
+		{
+			__try {
+				const auto flags = *Field<const std::uint16_t>(a_controller, Offset::kControllerFlags);
+				if ((flags & kControllerActive) == 0 || (flags & kControllerManaged) != 0) {
+					return false;
+				}
+				const auto root = *Field<RE::NiAVObject* const>(a_controller, Offset::kControllerTarget);
+				if (!root || !IsExactNode(root) || !root->parent || !UnrotatedUnscaled(root->parent->world)) {
+					return false;
+				}
+				const auto ref = reinterpret_cast<const RE::TESObjectREFR*>(root->userData);
+				if (!ref || ref->Get3D() != root || !PosedByOwnModel(root) || !g_poseHold(ref)) {
+					return false;
+				}
+				for (auto controller = root->controllers.get(); controller;
+					 controller = *Field<RE::NiTimeController* const>(controller, Offset::kControllerNext)) {
+					using stop_t = void (*)(RE::NiTimeController*);
+					reinterpret_cast<stop_t>((*reinterpret_cast<std::uintptr_t* const*>(controller))[kControllerStopSlot])(controller);
+				}
+				auto placement = Placement(ref);
+				placement.translate -= root->parent->world.translate;
+				if (!Near(root->local, placement)) {
+					root->local = placement;
+					*Field<std::uint32_t>(a_data, Offset::kUpdateDataFlags) |= kTargetMoved;
+					g_poseMoved.fetch_add(1, std::memory_order_relaxed);
+				}
+				g_poseHeld.fetch_add(1, std::memory_order_relaxed);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		void PoseUpdateThunk(void* a_controller, void* a_data)
+		{
+			if (!HoldPose(a_controller, a_data)) {
+				g_poseOriginal(a_controller, a_data);
+			}
+		}
+	}
+
+	bool InstallPoseHook(bool (*a_hold)(const RE::TESObjectREFR*))
+	{
+		bool       ok = true;
+		const auto update = Resolve(kPoseUpdateID, "NiTransformController::Update", ok);
+		if (!ok || !a_hold || !g.transformControllerVtable) {
+			return false;
+		}
+		const auto current = reinterpret_cast<const std::uintptr_t*>(g.transformControllerVtable)[kPoseUpdateSlot];
+		if (current != update) {
+			logger::error("NiTransformController's vtable slot 0x{:X} is not the engine's Update ({:X}): posed models are left as they are", kPoseUpdateSlot, current);
+			return false;
+		}
+		g_poseHold = a_hold;
+		REL::Relocation<std::uintptr_t> vtable{ g.transformControllerVtable };
+		g_poseOriginal = reinterpret_cast<PoseUpdateFunc>(vtable.write_vfunc(kPoseUpdateSlot, &PoseUpdateThunk));
+		return true;
+	}
+
+	void TakePoseHolds(std::uint32_t& a_held, std::uint32_t& a_moved) noexcept
+	{
+		a_held = g_poseHeld.exchange(0, std::memory_order_relaxed);
+		a_moved = g_poseMoved.exchange(0, std::memory_order_relaxed);
 	}
 }

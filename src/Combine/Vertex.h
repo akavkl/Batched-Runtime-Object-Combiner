@@ -62,6 +62,13 @@ namespace RC::Vertex
 		float rotation[3][3]{};
 	};
 
+	// x' = a_outer(a_inner(x)).
+	[[nodiscard]] Affine Compose(const Affine& a_outer, const Affine& a_inner) noexcept;
+	// The inverse of a world transform: a rotation times a_scale (uniform, not 0) plus a translation.
+	[[nodiscard]] Affine Inverse(const Affine& a_affine, float a_scale) noexcept;
+	// A point through the transform.
+	void Apply(const Affine& a_affine, const float a_in[3], float a_out[3]) noexcept;
+
 	// Writes a_count vertices from a_src (a_from) into a_dst (a_to; Convertible). Attributes other than position,
 	// normal and tangent are copied unchanged. a_min / a_max grow to include every written position.
 	void Transform(const Layout& a_from, const std::byte* a_src, const Layout& a_to, std::byte* a_dst, std::uint32_t a_count, const Affine& a_affine, float a_min[3], float a_max[3]) noexcept;

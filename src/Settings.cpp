@@ -58,6 +58,7 @@ namespace RC
 		settleFrames = std::clamp(ReadUInt(path, L"Combine", L"iSettleFrames", settleFrames), 1u, 600u);
 		gatherBudgetMs = std::clamp(ReadFloat(path, L"Combine", L"fGatherBudgetMs", gatherBudgetMs), 0.1F, 50.0F);
 		chunkFadeNodes = ReadBool(path, L"Combine", L"bChunkFadeNodes", chunkFadeNodes);
+		chunkMeshLOD = ReadBool(path, L"Combine", L"bChunkMeshLOD", chunkMeshLOD);
 		parkHidden = ReadBool(path, L"Combine", L"bParkHidden", parkHidden);
 		chunkGrowth = ReadFloat(path, L"Combine", L"fChunkGrowth", chunkGrowth);
 		chunkGrowth = chunkGrowth <= 0.0F ? 0.0F : std::clamp(chunkGrowth, 256.0F, 65536.0F);
@@ -69,14 +70,15 @@ namespace RC
 
 		logCells = ReadBool(path, L"Debug", L"bLogCells", logCells);
 		watchdogRefsPerFrame = std::clamp(ReadUInt(path, L"Debug", L"iWatchdogRefsPerFrame", watchdogRefsPerFrame), 16u, 1u << 20);
+		probes = ReadBool(path, L"Debug", L"bProbes", probes);
 
 		logger::info(
 			"settings ({}): enabled {}, disablePrecombines {}, apply {}, toggleHotkey 0x{:X}, notify {}, "
-			"chunkSize {}, maxShapeRadius {}, minShapesPerChunk {}, settleFrames {}, gatherBudgetMs {}, chunkFadeNodes {}, parkHidden {}, "
-			"chunkGrowth {}, clusterSpread {}, groupSize {}, combineDuringLoad {}, loadWaitMs {}, logCells {}, watchdogRefsPerFrame {}",
+			"chunkSize {}, maxShapeRadius {}, minShapesPerChunk {}, settleFrames {}, gatherBudgetMs {}, chunkFadeNodes {}, chunkMeshLOD {}, parkHidden {}, "
+			"chunkGrowth {}, clusterSpread {}, groupSize {}, combineDuringLoad {}, loadWaitMs {}, logCells {}, watchdogRefsPerFrame {}, probes {}",
 			exists ? "RuntimeCombiner.ini" : "defaults, no RuntimeCombiner.ini",
 			enabled, disablePrecombines, apply, toggleHotkey, notify,
-			chunkSize, maxShapeRadius, minShapesPerChunk, settleFrames, gatherBudgetMs, chunkFadeNodes, parkHidden, chunkGrowth, clusterSpread, groupSize,
-			combineDuringLoad, loadWaitMs, logCells, watchdogRefsPerFrame);
+			chunkSize, maxShapeRadius, minShapesPerChunk, settleFrames, gatherBudgetMs, chunkFadeNodes, chunkMeshLOD, parkHidden, chunkGrowth, clusterSpread, groupSize,
+			combineDuringLoad, loadWaitMs, logCells, watchdogRefsPerFrame, probes);
 	}
 }

@@ -3,6 +3,7 @@
 #include <DirectXPackedVector.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 
@@ -63,15 +64,30 @@ namespace RC::Vertex
 		}
 	}
 
+	namespace
+	{
+		// ByteToUnit of every byte, computed once: Transform reads six a vertex.
+		const std::array<float, 256> kUnits = [] {
+			std::array<float, 256> units{};
+			for (std::size_t i = 0; i < units.size(); ++i) {
+				units[i] = static_cast<float>(i) / 255.0F * 2.0F - 1.0F;
+			}
+			return units;
+		}();
+	}
+
 	float ByteToUnit(std::uint8_t a_byte) noexcept
 	{
-		return static_cast<float>(a_byte) / 255.0F * 2.0F - 1.0F;
+		return kUnits[a_byte];
 	}
 
 	std::uint8_t UnitToByte(float a_value) noexcept
 	{
+		// Rounded half away from zero, as std::lround did, without its CRT call (eight a vertex took most of the bake):
+		// scaled lies in [0, 255], where + 0.5 is exact in double and the cast truncates to the floor. NaN gives 0, as
+		// lround's out-of-range result clamped to 0 did.
 		const float scaled = (std::clamp(a_value, -1.0F, 1.0F) + 1.0F) * 127.5F;
-		return static_cast<std::uint8_t>(std::clamp(std::lround(scaled), 0L, 255L));
+		return scaled >= 0.0F ? static_cast<std::uint8_t>(static_cast<double>(scaled) + 0.5) : std::uint8_t{ 0 };
 	}
 
 	bool Decode(std::uint64_t a_desc, Layout& a_out) noexcept
@@ -140,13 +156,51 @@ namespace RC::Vertex
 		       a_to.tangent == (a_from.tangent ? moved(a_from.tangent) : 0);
 	}
 
+	Affine Compose(const Affine& a_outer, const Affine& a_inner) noexcept
+	{
+		Affine out;
+		for (int i = 0; i < 3; ++i) {
+			for (int j = 0; j < 3; ++j) {
+				out.linear[i][j] = a_outer.linear[i][0] * a_inner.linear[0][j] + a_outer.linear[i][1] * a_inner.linear[1][j] + a_outer.linear[i][2] * a_inner.linear[2][j];
+				out.rotation[i][j] = a_outer.rotation[i][0] * a_inner.rotation[0][j] + a_outer.rotation[i][1] * a_inner.rotation[1][j] + a_outer.rotation[i][2] * a_inner.rotation[2][j];
+			}
+		}
+		Apply(a_outer, a_inner.translate, out.translate);
+		return out;
+	}
+
+	Affine Inverse(const Affine& a_affine, float a_scale) noexcept
+	{
+		// The rotation is orthonormal: its inverse is its transpose.
+		Affine out;
+		for (int i = 0; i < 3; ++i) {
+			for (int j = 0; j < 3; ++j) {
+				out.rotation[i][j] = a_affine.rotation[j][i];
+				out.linear[i][j] = a_affine.rotation[j][i] / a_scale;
+			}
+		}
+		for (int i = 0; i < 3; ++i) {
+			out.translate[i] = -(out.linear[i][0] * a_affine.translate[0] + out.linear[i][1] * a_affine.translate[1] + out.linear[i][2] * a_affine.translate[2]);
+		}
+		return out;
+	}
+
+	void Apply(const Affine& a_affine, const float a_in[3], float a_out[3]) noexcept
+	{
+		float out[3];
+		for (int i = 0; i < 3; ++i) {
+			out[i] = a_affine.linear[i][0] * a_in[0] + a_affine.linear[i][1] * a_in[1] + a_affine.linear[i][2] * a_in[2] + a_affine.translate[i];
+		}
+		std::memcpy(a_out, out, sizeof(out));
+	}
+
 	void Transform(const Layout& a_from, const std::byte* a_src, const Layout& a_to, std::byte* a_dst, std::uint32_t a_count, const Affine& a_affine, float a_min[3], float a_max[3]) noexcept
 	{
 		const auto tail = a_from.stride - a_from.position - a_from.PositionBytes();  // the attributes after the position
 		for (std::uint32_t v = 0; v < a_count; ++v) {
 			const auto source = a_src + static_cast<std::size_t>(v) * a_from.stride;
 			const auto vertex = a_dst + static_cast<std::size_t>(v) * a_to.stride;
-			std::memcpy(vertex, source, a_from.position);
+			// (nothing before the position: Decode takes it only at offset 0)
 			std::memcpy(vertex + a_to.position + a_to.PositionBytes(), source + a_from.position + a_from.PositionBytes(), tail);
 
 			float position[4];

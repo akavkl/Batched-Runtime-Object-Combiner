@@ -286,6 +286,78 @@ namespace RC::Combine::Manager
 			return base && (base->Is(RE::ENUM_FORM_ID::kSTAT) || base->Is(RE::ENUM_FORM_ID::kSCOL));
 		}
 
+		// HoldsPose's lookup, read without a lock: every attached cell's form id and its precombined references' (cell,
+		// reference) pairs, sorted. PollCells rebuilds it whenever the attached cells change (game thread or LoadPass,
+		// under g_stateMutex) and swaps the pointer; a replaced table is freed on a later tick once no reader is inside
+		// one (g_poseReaders: a reader counts itself in before it loads the pointer). Readers never wait.
+		struct PoseTable
+		{
+			std::vector<std::uint32_t> cells;  // attached cells' form ids
+			std::vector<std::uint64_t> refs;   // cell form id << 32 | reference form id
+		};
+		std::atomic<const PoseTable*>                 g_poseTable{ nullptr };
+		std::atomic<std::uint32_t>                    g_poseReaders{ 0 };
+		std::vector<std::unique_ptr<const PoseTable>> g_poseRetired;  // under g_stateMutex
+		std::atomic<std::uint32_t>                    g_poseLookups{ 0 };
+		std::atomic<std::uint32_t>                    g_poseLocked{ 0 };
+
+		void RebuildPoseTable()
+		{
+			auto                       table = std::make_unique<PoseTable>();
+			std::vector<std::uint32_t> ids;
+			for (const auto& [cell, state] : g_cells) {
+				table->cells.push_back(state.formID);
+				ids.clear();
+				Engine::CombinedRefIDs(Engine::CombinedRefs(cell), ids);
+				for (const auto id : ids) {
+					table->refs.push_back(static_cast<std::uint64_t>(state.formID) << 32 | id);
+				}
+			}
+			std::ranges::sort(table->cells);
+			std::ranges::sort(table->refs);
+			if (const auto old = g_poseTable.exchange(table.release())) {
+				g_poseRetired.emplace_back(old);
+			}
+		}
+
+		void FreeRetiredPoseTables()
+		{
+			if (!g_poseRetired.empty() && g_poseReaders.load() == 0) {
+				g_poseRetired.clear();
+			}
+		}
+
+		// Engine::InstallPoseHook's question, on an animation job's thread: whether a reference whose model poses its
+		// root stays at its placement. Yes for a precombined static while RC keeps the precombines off: the precombines
+		// draw it there (FO4-ENGINE-NOTES 7.16), and its own 3D now draws from the first frame as they did, whether or
+		// not a chunk replaces it yet (run 44: the pose drew it 8-25x too large until the cell was combined).
+		[[nodiscard]] bool HoldsPose(const RE::TESObjectREFR* a_ref)
+		{
+			if (!Settings::Get().disablePrecombines || Engine::PrecombinesEnabled() || !IsCombinableBase(a_ref)) {
+				return false;
+			}
+			const auto cell = a_ref->GetParentCell();
+			if (!cell) {
+				return false;
+			}
+			const std::uint32_t cellID = cell->GetFormID();
+			const std::uint64_t key = static_cast<std::uint64_t>(cellID) << 32 | a_ref->GetFormID();
+			int                 verdict = -1;  // the cell isn't in the table yet
+			g_poseReaders.fetch_add(1);
+			if (const auto table = g_poseTable.load(); table && std::ranges::binary_search(table->cells, cellID)) {
+				verdict = std::ranges::binary_search(table->refs, key) ? 1 : 0;
+			}
+			g_poseReaders.fetch_sub(1);
+			g_poseLookups.fetch_add(1, std::memory_order_relaxed);
+			if (verdict >= 0) {
+				return verdict == 1;
+			}
+			// A cell attached since the last poll (a new exterior cell while walking): the engine's set, behind the
+			// extra list's read lock, until PollCells adds the cell.
+			g_poseLocked.fetch_add(1, std::memory_order_relaxed);
+			return Engine::InCombinedRefs(Engine::CombinedRefs(cell), a_ref->GetFormID());
+		}
+
 		void Notify(const std::string& a_text)
 		{
 			logger::info("{}", a_text);
@@ -752,13 +824,13 @@ namespace RC::Combine::Manager
 			}
 			const auto& s = a_job.stats;
 			logger::info(
-				"cell {} {} (chunk size {:.0f}-{:.0f}): {} references, {} with meshes captured ({} meshes), {} of them listed as precombined; {} chunks replace {} meshes ({} tris, {} verts, {:.1f} MB), "
-				"{} of them copies of one mesh ({} meshes; copy-only meshes: {}), {} stragglers joined a nearby chunk, {} meshes alone cloned as they "
+				"cell {} {} (chunk size {:.0f}-{:.0f}): {} references, {} with meshes captured ({} meshes), {} of them listed as precombined ({} posed by their own model: baked at their placement); {} chunks replace {} meshes ({} tris, {} verts, {:.1f} MB), "
+				"{} of them keep mesh LOD ({} of their {} tris at the farthest level), {} of them copies of one mesh ({} meshes; copy-only meshes: {}), {} stragglers joined a nearby chunk, {} meshes alone cloned as they "
 				"are (not mergeable: {}; mergeable, alone: {}); {} references hidden whole ({} of them by their meshes: the root owns collision), {} partly; gather {:.2f} ms, bake {:.2f} ms (worker), apply "
 				"{:.2f} ms; left out: {}",
 				CellName(a_job.cell, a_job.cellFormID), a_what, a_job.chunkSize * FactorRange(a_job.cell, a_job.sizing).first,
-				a_job.chunkSize * FactorRange(a_job.cell, a_job.sizing).second, s.references, s.candidates, s.capturedShapes, s.precombinedRefs, s.chunks, s.bakedShapes,
-				s.triangles, s.vertices, static_cast<double>(s.vertexBytes) / (1 << 20), s.copyChunks, s.copyShapes, SkipSummary(s.copies), s.joined,
+				a_job.chunkSize * FactorRange(a_job.cell, a_job.sizing).second, s.references, s.candidates, s.capturedShapes, s.precombinedRefs, s.posedRefs, s.chunks, s.bakedShapes,
+				s.triangles, s.vertices, static_cast<double>(s.vertexBytes) / (1 << 20), s.lodChunks, s.lodTriangles, s.lodFullTriangles, s.copyChunks, s.copyShapes, SkipSummary(s.copies), s.joined,
 				s.solos, SkipSummary(s.cloned), AloneSummary(s.alone), s.wholeRefs, s.solidRefs, s.partialRefs, s.gatherMs, s.bakeMs, s.applyMs, SkipSummary(s.skips));
 		}
 
@@ -779,10 +851,10 @@ namespace RC::Combine::Manager
 			}
 			g_previsTick = g_frame;
 			++g_previsFrames;
-			// Read for the summary's audit and previs line only: in the frames just before it, not every frame. Only
-			// while previs draws the main view (group 0 undrawn): where CBRO draws group 0 it may skip the query, and
+			// Read for the summary's audit and previs line only (bProbes): in the frames just before it, not every frame.
+			// Only while previs draws the main view (group 0 undrawn): where CBRO draws group 0 it may skip the query, and
 			// the bits are then stale (CBRO v1.66, FO4-ENGINE-NOTES 5.5d).
-			if (Clock::now() - g_lastSummary < kSummaryInterval - std::chrono::milliseconds(200)) {
+			if (!Settings::Get().probes || Clock::now() - g_lastSummary < kSummaryInterval - std::chrono::milliseconds(200)) {
 				return;
 			}
 			g_previsVisibleRead = !g_group0Drawn;
@@ -937,6 +1009,14 @@ namespace RC::Combine::Manager
 				}
 			}
 
+			// Self-check (bProbes; run 40, objects piled up): where each chunk must stand (its bake's bound, or a solo's
+			// original's), and the members baked off their own world bounds.
+			const bool               selfCheck = Settings::Get().probes;
+			std::vector<RE::NiBound> expected;
+			std::uint32_t            strays = 0;
+			std::uint32_t            strayChunks = 0;
+			std::string              straySample;
+
 			std::size_t chunkIndex = 0;
 			for (std::uint32_t bucketIndex = 0; bucketIndex < a_job.buckets.size(); ++bucketIndex) {
 				auto& bucket = a_job.buckets[bucketIndex];
@@ -956,24 +1036,42 @@ namespace RC::Combine::Manager
 						if (!clone || !(Engine::IsExactTriShape(clone.get()) || Engine::IsExactMeshLODTriShape(clone.get()))) {
 							continue;
 						}
-						clone->local = source.world;
-						clone->local.translate = RE::NiPoint3{ source.world.translate.x - parentWorld.x, source.world.translate.y - parentWorld.y,
-							source.world.translate.z - parentWorld.z };
+						clone->local = source.draw;
+						clone->local.translate = RE::NiPoint3{ source.draw.translate.x - parentWorld.x, source.draw.translate.y - parentWorld.y,
+							source.draw.translate.z - parentWorld.z };
 					} else {
 						if (!triShape) {
 							continue;
 						}
 						// The chunk's mesh is a clone of one member (its shader and alpha properties, flags and name)
-						// with the combined data in place of the member's.
-						const auto representative = a_job.shapes[bucket.shapes[chunk.baked.front()]].shape.get();
-						clone.reset(Engine::Clone(representative));
-						if (!clone || !Engine::IsExactTriShape(clone.get())) {
+						// with the combined data in place of the member's. With bChunkMeshLOD, a chunk whose members have
+						// mesh-LOD segments is a clone of one such member that stays a BSMeshLODTriShape, with the chunk's
+						// segments: its fade node's level picks the prefix, as the members' own nodes did (FO4-ENGINE-NOTES
+						// 7.11). Its members share a mergeable property, so which member is cloned doesn't matter.
+						const bool meshLOD = fadeNodes && Settings::Get().chunkMeshLOD && (chunk.lodSizes[1] || chunk.lodSizes[2]);
+						auto       representative = a_job.shapes[bucket.shapes[chunk.baked.front()]].shape.get();
+						for (const auto member : chunk.baked) {
+							const auto shape = a_job.shapes[bucket.shapes[member]].shape.get();
+							if (meshLOD && Engine::IsExactMeshLODTriShape(shape)) {
+								representative = shape;
+								break;
+							}
+						}
+						clone.reset(Engine::Clone(representative, !meshLOD));
+						const bool lodClone = meshLOD && clone && Engine::IsExactMeshLODTriShape(clone.get());
+						if (!clone || !(lodClone || Engine::IsExactTriShape(clone.get()))) {
 							Engine::ReleaseTriShape(triShape);
 							triShape = nullptr;
 							continue;
 						}
 						Engine::SetGeometry(clone.get(), triShape, chunk.vertexCount, chunk.triangleCount);
 						triShape = nullptr;  // owned by the clone now
+						if (lodClone) {
+							std::copy_n(chunk.lodSizes, 3, Engine::Field<std::uint32_t>(clone.get(), Engine::Offset::kLODSizes));
+							++stats.lodChunks;
+							stats.lodTriangles += chunk.lodSizes[0];
+							stats.lodFullTriangles += chunk.triangleCount;
+						}
 
 						auto& bound = *Engine::Field<RE::NiBound>(clone.get(), Engine::Offset::kModelBound);
 						bound.center = RE::NiPoint3{ chunk.boundCenter[0], chunk.boundCenter[1], chunk.boundCenter[2] };
@@ -1024,6 +1122,30 @@ namespace RC::Combine::Manager
 					}
 					applied->groups[slot->second].node->AttachChild(fadeNode ? static_cast<RE::NiAVObject*>(fadeNode.get()) : clone.get(), true);
 					auto& record = applied->chunks.emplace_back();
+					if (selfCheck) {
+						auto& want = expected.emplace_back();
+						if (chunk.solo) {
+							const auto& member = bucket.members[chunk.baked.front()];
+							want.center = RE::NiPoint3{ member.center[0], member.center[1], member.center[2] };
+							want.fRadius = member.radius;
+						} else {
+							want.center = RE::NiPoint3{ chunk.origin[0] + chunk.boundCenter[0], chunk.origin[1] + chunk.boundCenter[1], chunk.origin[2] + chunk.boundCenter[2] };
+							want.fRadius = chunk.boundRadius;
+						}
+					}
+					if (selfCheck && !chunk.solo && chunk.strays) {
+						strays += chunk.strays;
+						if (strayChunks++ < 8) {
+							const auto& source = a_job.shapes[bucket.shapes[chunk.firstStray]];
+							const auto& member = bucket.members[chunk.firstStray];
+							const auto& ref = a_job.refs[source.ref];
+							const auto  base = ref.ref ? ref.ref->GetObjectReference() : nullptr;
+							straySample += std::format("{}'{}' {} ({}, ref {:08X} {}, scale {:.2f}, desc {:016X}, {} verts {} tris): bound r={:.0f}, vertex box {:.0f} off its centre, half diagonal {:.0f}",
+								straySample.empty() ? "" : " | ", source.shape->name.c_str(), reinterpret_cast<const RE::NiObjectNET*>(bucket.property)->name.c_str(),
+								Engine::ClassName(source.shape.get()), ref.formID, base && base->Is(RE::ENUM_FORM_ID::kSCOL) ? "SCOL" : "STAT", source.draw.scale,
+								bucket.desc, member.vertexCount, member.triangleCount, member.radius, chunk.strayOffset, chunk.strayExtent);
+						}
+					}
 					record.shape = clone;
 					record.fadeNode = fadeNode.get();
 					record.group = slot->second;
@@ -1065,6 +1187,26 @@ namespace RC::Combine::Manager
 			// clone was built (FO4-ENGINE-NOTES 7.10).
 			for (auto& container : applied->containers) {
 				Engine::UpdateStatic(container.node.get());
+			}
+			std::uint32_t misplaced = 0;
+			std::string   misplacedSample;
+			for (std::size_t i = 0; selfCheck && i < applied->chunks.size(); ++i) {
+				const auto& record = applied->chunks[i];
+				const auto& bound = record.shape->worldBound;
+				const auto& want = expected[i];
+				const float tolerance = 1.0F + 0.01F * want.fRadius;
+				if (bound.center.GetDistance(want.center) > tolerance || std::abs(bound.fRadius - want.fRadius) > tolerance) {
+					if (misplaced++ < 8) {
+						misplacedSample += std::format("{}'{}' ({} members): at ({:.0f}, {:.0f}, {:.0f}) r={:.0f}, bake ({:.0f}, {:.0f}, {:.0f}) r={:.0f}",
+							misplacedSample.empty() ? "" : " | ", record.shape->name.c_str(), record.members, bound.center.x, bound.center.y,
+							bound.center.z, bound.fRadius, want.center.x, want.center.y, want.center.z, want.fRadius);
+					}
+				}
+			}
+			if (selfCheck) {
+				logger::info("cell {} self-check: {} members in {} chunks baked off their own bounds{}{}; {} of {} chunks placed off their bake{}{}",
+					CellName(a_job.cell, a_job.cellFormID), strays, strayChunks, straySample.empty() ? "" : ": ", straySample, misplaced,
+					applied->chunks.size(), misplacedSample.empty() ? "" : ": ", misplacedSample);
 			}
 
 			// Hide what the chunks now draw: a reference whose every part was combined is hidden at its root (the
@@ -1370,7 +1512,10 @@ namespace RC::Combine::Manager
 				}
 			}
 			if (added || removed) {
-				logger::info("attached cells: {} (+{}, -{})", g_cells.size(), added, removed);
+				const auto start = Clock::now();
+				RebuildPoseTable();
+				logger::info("attached cells: {} (+{}, -{}); pose table {} references, rebuilt in {:.2f} ms", g_cells.size(), added, removed,
+					g_poseTable.load()->refs.size(), Ms(start));
 			}
 		}
 
@@ -1742,6 +1887,37 @@ namespace RC::Combine::Manager
 			logger::info("blocked parts in the attached cells: {} ({})", all, text.empty() ? "none"s : text);
 		}
 
+		// GPU probe (bProbes): work and time per render stage, per measured frame (counts in millions), and the
+		// composite's image-space effects.
+		void LogGpu()
+		{
+			std::string gpu;
+			for (std::size_t i = 0; const auto& stage : Engine::TakeGpuStats()) {
+				const double n = stage.frames ? 1e6 * static_cast<double>(stage.frames) : 1.0;
+				gpu += std::format("{}{}: GPU {:.2f} ms ({} timed), triangles in {:.3f}, rasterized {:.3f}, vertices shaded {:.3f}, pixels shaded "
+								   "{:.3f}, compute threads {:.3f} ({} read, {} skipped)",
+					i ? " | " : "", Engine::GpuStageName(i), stage.timed ? stage.gpuMs / static_cast<double>(stage.timed) : 0.0, stage.timed,
+					stage.iaPrimitives / n, stage.cPrimitives / n, stage.vsInvocations / n, stage.psInvocations / n, stage.csInvocations / n,
+					stage.frames, stage.skipped);
+				++i;
+			}
+			logger::info("GPU work per frame in millions ({}, precombines {}): {}", g_active ? "on" : "switched off",
+				Engine::PrecombinesEnabled() ? "on" : "off", gpu);
+			std::string effects;
+			for (const auto& effect : Engine::TakeCompositeEffects()) {
+				std::string_view name = effect.name;
+				if (name.starts_with(".?AV")) {
+					name.remove_prefix(4);
+				}
+				if (name.ends_with("@@")) {
+					name.remove_suffix(2);
+				}
+				effects += std::format("{}{}: {:.2f} ms ({} timed)", effects.empty() ? "" : " | ", name.empty() ? "(none)" : name,
+					effect.timed ? effect.gpuMs / static_cast<double>(effect.timed) : 0.0, effect.timed);
+			}
+			logger::info("composite effects, GPU time per frame: {}", effects);
+		}
+
 		void Summary()
 		{
 			const auto now = Clock::now();
@@ -1759,6 +1935,10 @@ namespace RC::Combine::Manager
 					times.tickMs / times.frames, times.tickMax, queries ? queryMs / queries : 0.0, queries,
 					g_active ? "on" : "switched off", Engine::PrecombinesEnabled() ? "on" : "off");
 			}
+			const bool probes = Settings::Get().probes;
+			if (probes) {
+				LogGpu();
+			}
 			std::size_t cells = 0, chunks = 0, hidden = 0, building = 0, blind = 0;
 			for (const auto& [cell, state] : g_cells) {
 				building += state.building ? 1 : 0;
@@ -1773,7 +1953,7 @@ namespace RC::Combine::Manager
 			const auto camera = RE::Main::WorldRootCamera();
 			const auto eye = camera ? camera->world.translate : RE::NiPoint3{};
 			const auto version = g_totals.applies * 1000003 + g_totals.reverts * 1009 + g_cells.size() * 7 + (Engine::PrecombinesEnabled() ? 1 : 0);
-			const bool census = version != g_censusVersion || eye.GetDistance(g_censusEye) >= kCensusMove;
+			const bool census = probes && (version != g_censusVersion || eye.GetDistance(g_censusEye) >= kCensusMove);
 			if (census) {
 				g_censusVersion = version;
 				g_censusEye = eye;
@@ -1815,8 +1995,20 @@ namespace RC::Combine::Manager
 				g_previsPaused ? "previs active without the query hook (originals shown), " : "", Engine::PrecombinesEnabled() ? "on" : "off", precombined,
 				g_precombinesNext.load() < 0 ? "" : g_precombinesNext.load() ? " (on after the next save load)" : " (off after the next save load)", g_totals.applies,
 				g_totals.reverts, g_totals.blind, g_totals.discarded, g_totals.watchdog, g_totals.attached, votes.agree, votes.disagree);
-			AuditChunks();
-			LogPrevis();
+			std::uint32_t posedMoved = 0, posedHeld = 0;
+			Engine::TakePoseHolds(posedHeld, posedMoved);
+			if (posedHeld) {
+				logger::info("posed roots held at their placement since the last summary: {} ({} of them already posed: drawn so until then)",
+					posedHeld, posedMoved);
+			}
+			if (const auto lookups = g_poseLookups.exchange(0, std::memory_order_relaxed)) {
+				logger::info("pose hold lookups since the last summary: {} ({} of them through the engine's lock: a cell attached since the last poll)",
+					lookups, g_poseLocked.exchange(0, std::memory_order_relaxed));
+			}
+			if (probes) {
+				AuditChunks();
+				LogPrevis();
+			}
 			LogBlocked();
 			if (census) {
 				LogCensus();
@@ -1915,6 +2107,7 @@ namespace RC::Combine::Manager
 			}
 			CheckSizing();
 			PollCells();
+			FreeRetiredPoseTables();
 			DrainEvents();
 			TakeOutLoaded();
 
@@ -2029,9 +2222,21 @@ namespace RC::Combine::Manager
 		} else {
 			logger::warn("game reset not hooked: F3 only swaps chunks and originals; precombines stay as set at startup");
 		}
+		if (Engine::InstallPoseHook(&HoldsPose)) {
+			logger::info("NiTransformController::Update hooked: a precombined static's model can't pose its root away from its placement "
+						 "while precombines are off");
+		} else {
+			logger::warn("NiTransformController::Update not hooked: precombined statics whose model poses its root draw posed until combined");
+		}
 		if (Settings::Get().combineDuringLoad) {
 			const auto sites = Engine::InstallLoadingMenuHook(&LoadPass);
 			logger::info("TES::HideLoadingMenu hooked at {} call sites: cells are combined before the loading menu closes", sites);
+		}
+		if (Settings::Get().probes) {
+			logger::info("GPU probe: {} of 4 Render_PreUI calls wrapped (pipeline statistics over the whole frame in each summary)",
+				Engine::InstallGpuStatsProbe());
+		} else {
+			logger::info("probes off (bProbes=0): no GPU probe, census, chunk audit, previs line or self-check");
 		}
 	}
 

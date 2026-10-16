@@ -98,7 +98,24 @@ namespace RC::Combine::Gather
 		{
 			std::vector<Candidate> candidates;
 			bool                   blocked{ false };  // a part renders on its own: the root can't be hidden
+			const RE::NiAVObject*  poseRoot{ nullptr };  // a root whose controllers only pose it (Cell): not animated
+			float                  radiusScale{ 1.0F };  // world bound radius -> the radius where the chunk draws it
 		};
+
+		// The engine's form of a transform the bake holds as an affine (ModelToWorld's inverse).
+		[[nodiscard]] RE::NiTransform ToTransform(const Vertex::Affine& a_affine, float a_scale) noexcept
+		{
+			RE::NiTransform transform;
+			transform.MakeIdentity();
+			for (int i = 0; i < 3; ++i) {
+				for (int j = 0; j < 3; ++j) {
+					transform.rotate.entry[j].pt[i] = a_affine.rotation[i][j];
+				}
+			}
+			transform.translate = RE::NiPoint3{ a_affine.translate[0], a_affine.translate[1], a_affine.translate[2] };
+			transform.scale = a_scale;
+			return transform;
+		}
 
 		// How a mesh can be replaced.
 		enum class Fit
@@ -108,7 +125,7 @@ namespace RC::Combine::Gather
 			kMerge,  // its vertices can go into a combined mesh
 		};
 
-		Fit Check(RE::NiAVObject* a_shape, Stats& a_stats, const Settings& a_settings, Candidate& a_out)
+		Fit Check(RE::NiAVObject* a_shape, Stats& a_stats, const Settings& a_settings, float a_radiusScale, Candidate& a_out)
 		{
 			if (*Field<void*>(a_shape, Offset::kSkinInstance)) {
 				a_stats.Count(Skip::kSkinned);
@@ -140,7 +157,7 @@ namespace RC::Combine::Gather
 				return Fit::kKeep;
 			}
 			const auto& worldBound = a_shape->worldBound;
-			if (!std::isfinite(worldBound.fRadius) || worldBound.fRadius > a_settings.maxShapeRadius ||
+			if (!std::isfinite(worldBound.fRadius) || worldBound.fRadius * a_radiusScale > a_settings.maxShapeRadius ||
 				!std::isfinite(worldBound.center.x) || !std::isfinite(worldBound.center.y) || !std::isfinite(worldBound.center.z)) {
 				a_stats.Count(Skip::kTooBig);
 				return Fit::kKeep;
@@ -225,6 +242,7 @@ namespace RC::Combine::Gather
 				const auto lodSizes = Field<std::uint32_t>(a_shape, Offset::kLODSizes);
 				const auto full = static_cast<std::uint64_t>(lodSizes[0]) + lodSizes[1] + lodSizes[2];
 				triangleCount = full <= triangleCount ? static_cast<std::uint32_t>(full) : 0;
+				std::copy_n(lodSizes, 3, member.lodSizes);  // its segments, for a chunk that keeps mesh LOD
 			}
 			// The buffer must hold exactly this mesh's vertices, and at least the triangles it draws.
 			if (!vertices || !indices || vertexCount == 0 || triangleCount == 0 ||
@@ -275,7 +293,7 @@ namespace RC::Combine::Gather
 			if (!a_object || CulledByGame(a_object, a_ours)) {
 				return;  // hidden parts stay hidden either way
 			}
-			if (a_object->controllers) {
+			if (a_object->controllers && a_object != a_scan.poseRoot) {
 				a_stats.CountBlocked("animated (a controller)");
 				a_scan.blocked = true;
 				return;
@@ -291,7 +309,7 @@ namespace RC::Combine::Gather
 			}
 			if (IsExactTriShape(a_object) || IsExactMeshLODTriShape(a_object)) {
 				Candidate candidate;
-				if (Check(a_object, a_stats, a_settings, candidate) != Fit::kKeep) {
+				if (Check(a_object, a_stats, a_settings, a_scan.radiusScale, candidate) != Fit::kKeep) {
 					a_scan.candidates.push_back(candidate);
 				} else {
 					a_scan.blocked = true;
@@ -452,11 +470,39 @@ namespace RC::Combine::Gather
 				continue;
 			}
 
+			// A precombined reference whose model poses its root (a NiTransformController with a constant pose; the
+			// Nuka-World bottles reset their reference scale to 1, run 43) stands where the pose put it, not where the
+			// precombines draw it: at its placement (FO4-ENGINE-NOTES 7.16). Its meshes are baked there instead, each
+			// world moved by placement x root world^-1, and judged by their size there. Other controllers, and poses
+			// below the root, stay blocked.
+			const bool     precombined = InCombinedRefs(combinedRefs, ref->GetFormID());
+			Vertex::Affine correction;
+			float          ratio = 1.0F;
+			bool           posed = false;
+			if (precombined && PosedByOwnModel(root)) {
+				const auto placement = Placement(ref);
+				const auto live = root->world.scale;
+				if (std::isfinite(placement.scale) && placement.scale > 0.0F && std::isfinite(live) && live > 0.0F) {
+					correction = Vertex::Compose(ModelToWorld(placement), Vertex::Inverse(ModelToWorld(root->world), live));
+					ratio = placement.scale / live;
+					posed = true;
+				}
+			}
 			scan.candidates.clear();
 			scan.blocked = a_meshByMesh.contains(ref->GetFormID());
+			scan.poseRoot = posed ? root : nullptr;
+			scan.radiusScale = ratio;
 			Walk(root, a_ours, stats, settings, scan);
 			if (scan.candidates.empty()) {
 				continue;
+			}
+			if (posed) {
+				for (auto& candidate : scan.candidates) {
+					auto& member = candidate.member;
+					member.toWorld = Vertex::Compose(correction, member.toWorld);
+					Vertex::Apply(correction, member.center, member.center);
+					member.radius *= ratio;
+				}
 			}
 
 			const auto refIndex = static_cast<std::uint32_t>(a_job.refs.size());
@@ -472,13 +518,13 @@ namespace RC::Combine::Gather
 			// precombined chunk does, from uGridsToLoad (fade class 0, FO4-ENGINE-NOTES 7.9). One class for all of them
 			// lets same-material meshes merge as the precombines do; per-reference classes split them into ~20% more
 			// objects, the extra in the sun's cascades (run 19).
-			const bool precombined = InCombinedRefs(combinedRefs, ref->GetFormID());
 			auto       fade = precombined ? FadeRange{} : ReadFadeRange(root);
 			const auto fadeKey = precombined ? 0 : FadeKey(fade, reach);
 			if (fadeKey == kNeverFades) {
 				fade = { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), 0 };
 			}
 			stats.precombinedRefs += precombined ? 1 : 0;
+			stats.posedRefs += posed ? 1 : 0;
 			for (const auto& candidate : scan.candidates) {
 				auto& bucket = BucketFor(candidate, parent, fadeKey, fade, a_job, index);
 				bucket.shapes.push_back(static_cast<std::uint32_t>(a_job.shapes.size()));
@@ -488,6 +534,7 @@ namespace RC::Combine::Gather
 				shape.ref = refIndex;
 				shape.rendererData = candidate.rendererData;
 				shape.world = candidate.shape->world;
+				shape.draw = posed ? ToTransform(Vertex::Compose(correction, ModelToWorld(shape.world)), shape.world.scale * ratio) : shape.world;
 			}
 			++stats.candidates;
 		}

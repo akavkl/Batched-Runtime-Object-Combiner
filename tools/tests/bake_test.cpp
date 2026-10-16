@@ -158,6 +158,39 @@ namespace
 		Check(lo[0] == 10 && hi[1] == 22, "bounds grow");
 	}
 
+	void TestCompose()
+	{
+		// a: 90 degrees about z (x -> y), scale 2, translate (10, 20, 30).
+		Vertex::Affine a;
+		const float    r[3][3]{ { 0, -1, 0 }, { 1, 0, 0 }, { 0, 0, 1 } };
+		for (int i = 0; i < 3; ++i) {
+			for (int j = 0; j < 3; ++j) {
+				a.rotation[i][j] = r[i][j];
+				a.linear[i][j] = 2.0F * r[i][j];
+			}
+		}
+		a.translate[0] = 10;
+		a.translate[1] = 20;
+		a.translate[2] = 30;
+		const auto near = [](const float a_p[3], float a_x, float a_y, float a_z) {
+			return std::abs(a_p[0] - a_x) < 1e-4F && std::abs(a_p[1] - a_y) < 1e-4F && std::abs(a_p[2] - a_z) < 1e-4F;
+		};
+		const float x[3]{ 1, 0, 0 };
+		float       p[3];
+		Vertex::Apply(a, x, p);
+		Check(near(p, 10, 22, 30), "apply: rotated, scaled, moved");
+		Vertex::Apply(Vertex::Compose(a, a), x, p);
+		Check(near(p, -34, 40, 90), "compose: a after a");
+		const auto  inverse = Vertex::Inverse(a, 2.0F);
+		const float q[3]{ 3, 4, 5 };
+		Vertex::Apply(Vertex::Compose(inverse, a), q, p);
+		Check(near(p, 3, 4, 5), "inverse after a is the identity");
+		Vertex::Apply(Vertex::Compose(a, inverse), q, p);
+		Check(near(p, 3, 4, 5), "a after inverse is the identity");
+		const auto both = Vertex::Compose(a, inverse);
+		Check(std::abs(both.rotation[0][0] - 1) < 1e-6F && std::abs(both.rotation[0][1]) < 1e-6F && std::abs(both.linear[1][1] - 1) < 1e-6F, "rotation and linear parts cancel");
+	}
+
 	void TestClusterAndBuild()
 	{
 		Vertex::Layout layout;
@@ -205,6 +238,28 @@ namespace
 			ReadPos(chunk.vertices.data() + 3 * layout.stride, false, p);  // second member's first vertex: x = 300 - origin
 			Check(std::abs(p[0] - (300.0F - chunk.origin[0])) < 0.5F, "positions relative to the chunk origin");
 			Check(chunk.boundRadius > 200.0F && chunk.boundRadius < 300.0F, "bound covers the members");
+			Check(chunk.lodSizes[0] == 3 && chunk.lodSizes[1] == 0 && chunk.lodSizes[2] == 0, "members without LOD: one segment");
+		}
+
+		// Mesh LOD: two members with segments {1, 1, 1} around one without (2 triangles). The chunk's indices are every
+		// member's first segment, then every second, then every third.
+		{
+			const std::uint16_t       lodIndices[9]{ 0, 1, 2, 1, 2, 0, 2, 0, 1 };
+			const std::uint16_t       plainIndices[6]{ 0, 1, 2, 0, 2, 1 };
+			std::vector<Bake::Member> lod(3, members[0]);
+			for (const std::size_t i : { 0u, 2u }) {
+				lod[i].indices = lodIndices;
+				lod[i].triangleCount = 3;
+				lod[i].lodSizes[0] = lod[i].lodSizes[1] = lod[i].lodSizes[2] = 1;
+			}
+			lod[1].indices = plainIndices;
+			lod[1].triangleCount = 2;
+			Bake::Chunk chunk;
+			chunk.members = { 0, 1, 2 };
+			Check(Bake::Build(layout, layout, lod, chunk, 2), "build with mesh LOD");
+			const std::vector<std::uint16_t> expected{ 0, 1, 2, 3, 4, 5, 3, 5, 4, 6, 7, 8, 1, 2, 0, 7, 8, 6, 2, 0, 1, 8, 6, 7 };
+			Check(chunk.indices == expected, "indices in segment order");
+			Check(chunk.lodSizes[0] == 4 && chunk.lodSizes[1] == 2 && chunk.lodSizes[2] == 2 && chunk.triangleCount == 8, "chunk segments");
 		}
 
 		// Four meshes on a diamond (radius 200): the box's corners are empty, so the bound is the farthest vertex's
@@ -390,6 +445,7 @@ int main()
 	TestDecode();
 	TestIdentityRoundTrip();
 	TestRotation();
+	TestCompose();
 	TestClusterAndBuild();
 	TestFullPrecision();
 	std::printf(g_failures ? "%d FAILURES\n" : "all passed\n", g_failures);

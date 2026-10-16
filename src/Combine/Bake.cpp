@@ -257,6 +257,15 @@ namespace RC::Bake
 		return chunks;
 	}
 
+	std::array<std::uint32_t, 3> Segments(const Member& a_member) noexcept
+	{
+		const auto& sizes = a_member.lodSizes;
+		if (static_cast<std::uint64_t>(sizes[0]) + sizes[1] + sizes[2] == a_member.triangleCount) {
+			return { sizes[0], sizes[1], sizes[2] };
+		}
+		return { a_member.triangleCount, 0, 0 };
+	}
+
 	bool Build(const Vertex::Layout& a_from, const Vertex::Layout& a_to, std::span<const Member> a_members, Chunk& a_chunk, std::uint32_t a_minMembers)
 	{
 		if (a_chunk.solo) {
@@ -279,6 +288,7 @@ namespace RC::Bake
 		a_chunk.vertices.assign(static_cast<std::size_t>(vertexTotal) * a_to.stride, std::byte{ 0 });
 		a_chunk.indices.resize(static_cast<std::size_t>(triangleTotal) * 3);
 		a_chunk.baked.clear();
+		a_chunk.strays = 0;
 
 		std::vector<std::byte>     source;
 		std::vector<std::uint16_t> sourceIndices;
@@ -286,6 +296,7 @@ namespace RC::Bake
 		float                      hi[3]{ -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() };
 		std::uint32_t              vertexBase = 0;
 		std::uint32_t              indexBase = 0;
+		std::vector<std::uint32_t> starts;  // each baked member's first index, in member order
 		for (const auto index : a_chunk.members) {
 			const auto& m = a_members[index];
 			const auto  vertexBytes = static_cast<std::size_t>(m.vertexCount) * a_from.stride;
@@ -304,10 +315,32 @@ namespace RC::Bake
 			for (int i = 0; i < 3; ++i) {
 				affine.translate[i] -= a_chunk.origin[i];
 			}
-			Vertex::Transform(a_from, source.data(), a_to, a_chunk.vertices.data() + static_cast<std::size_t>(vertexBase) * a_to.stride, m.vertexCount, affine, lo, hi);
+			float memberLo[3]{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
+			float memberHi[3]{ -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() };
+			Vertex::Transform(a_from, source.data(), a_to, a_chunk.vertices.data() + static_cast<std::size_t>(vertexBase) * a_to.stride, m.vertexCount, affine, memberLo, memberHi);
+			float offset = 0.0F;
+			float extent = 0.0F;
+			for (int i = 0; i < 3; ++i) {
+				lo[i] = std::min(lo[i], memberLo[i]);
+				hi[i] = std::max(hi[i], memberHi[i]);
+				const float off = 0.5F * (memberLo[i] + memberHi[i]) + a_chunk.origin[i] - m.center[i];
+				const float half = 0.5F * (memberHi[i] - memberLo[i]);
+				offset += off * off;
+				extent += half * half;
+			}
+			offset = std::sqrt(offset);
+			extent = std::sqrt(extent);
+			if (const float limit = 2.0F * m.radius + 64.0F; offset > limit || extent > limit) {
+				if (a_chunk.strays++ == 0) {
+					a_chunk.firstStray = index;
+					a_chunk.strayOffset = offset;
+					a_chunk.strayExtent = extent;
+				}
+			}
 			for (std::size_t i = 0; i < indexCount; ++i) {
 				a_chunk.indices[indexBase + i] = static_cast<std::uint16_t>(sourceIndices[i] + vertexBase);
 			}
+			starts.push_back(indexBase);
 			vertexBase += m.vertexCount;
 			indexBase += static_cast<std::uint32_t>(indexCount);
 			a_chunk.baked.push_back(index);
@@ -321,6 +354,23 @@ namespace RC::Bake
 		a_chunk.indices.resize(indexBase);
 		a_chunk.vertexCount = vertexBase;
 		a_chunk.triangleCount = indexBase / 3;
+
+		// Segment order (see Chunk::lodSizes): each member's triangles keep their order inside a segment.
+		std::vector<std::uint16_t> ordered;
+		ordered.reserve(indexBase);
+		for (std::uint32_t segment = 0; segment < 3; ++segment) {
+			a_chunk.lodSizes[segment] = 0;
+			for (std::size_t i = 0; i < a_chunk.baked.size(); ++i) {
+				const auto sizes = Segments(a_members[a_chunk.baked[i]]);
+				std::uint32_t first = starts[i];
+				for (std::uint32_t s = 0; s < segment; ++s) {
+					first += sizes[s] * 3;
+				}
+				ordered.insert(ordered.end(), a_chunk.indices.begin() + first, a_chunk.indices.begin() + first + sizes[segment] * 3);
+				a_chunk.lodSizes[segment] += sizes[segment];
+			}
+		}
+		a_chunk.indices = std::move(ordered);
 
 		// Bound: the box centre, radius to the farthest written vertex. The box's half diagonal overshoots a cluster
 		// by up to ~40% (its corners are mostly empty), and the sun's cascades file a chunk by its bound (run 25).

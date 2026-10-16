@@ -84,7 +84,11 @@ namespace RC::Combine
 		std::uint32_t joined{ 0 };           // stragglers that joined a nearby chunk (Bake::Cluster)
 		std::array<std::uint32_t, static_cast<std::size_t>(Alone::kCount)> alone{};  // mergeable solos by reason
 		std::uint32_t precombinedRefs{ 0 };  // captured references the cell's precombines list (one fade class)
+		std::uint32_t posedRefs{ 0 };        // of them, roots their own model poses: baked at their placement (Gather)
 		std::uint32_t triangles{ 0 };
+		std::uint32_t lodChunks{ 0 };        // chunks that keep their members' mesh LOD (bChunkMeshLOD, Manager)
+		std::uint32_t lodTriangles{ 0 };     // their triangles drawn at mesh-LOD level 1 (the farthest)
+		std::uint32_t lodFullTriangles{ 0 }; // and at level 3 (all)
 		std::uint32_t vertices{ 0 };
 		std::uint64_t vertexBytes{ 0 };      // their vertex data
 		std::uint32_t wholeRefs{ 0 };        // references hidden whole (the scene walk skips them)
@@ -128,7 +132,8 @@ namespace RC::Combine
 		RE::NiPointer<RE::NiAVObject> shape;
 		std::uint32_t                 ref{ 0 };  // index into Job::refs
 		const void*                   rendererData{ nullptr };
-		RE::NiTransform               world;
+		RE::NiTransform               world;  // at capture (the watchdog's reference)
+		RE::NiTransform               draw;   // where its chunk draws it: world, or for a posed root its placement's (Gather)
 		bool                          baked{ false };
 	};
 

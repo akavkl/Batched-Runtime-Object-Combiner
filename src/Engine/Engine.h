@@ -15,6 +15,12 @@ namespace RC::Engine
 	{
 		// NiObjectNET
 		inline constexpr std::size_t kControllers = 0x18;     // NiTimeController* (NiPointer)
+		// NiTimeController (FO4-ENGINE-NOTES 7.16)
+		inline constexpr std::size_t kControllerFlags = 0x10;   // u16: 0x8 active, 0x20 driven by a controller manager
+		inline constexpr std::size_t kControllerTarget = 0x38;  // NiObjectNET*
+		inline constexpr std::size_t kControllerNext = 0x40;    // the next controller in the target's list
+		// NiUpdateData
+		inline constexpr std::size_t kUpdateDataFlags = 0x10;   // u32: 0x100000 a controller moved its target (7.16)
 		// BSGeometry / BSTriShape
 		inline constexpr std::size_t kModelBound = 0x120;     // NiBound (local)
 		inline constexpr std::size_t kAlphaProperty = 0x130;  // NiAlphaProperty*
@@ -166,6 +172,27 @@ namespace RC::Engine
 	// Whether the main view processed the probe's group since the last call; clears the bit for the next one.
 	[[nodiscard]] bool TakeProbeSeen(RE::NiAVObject* a_probe) noexcept;
 
+	// A model that poses its own root: every controller on a_root is a NiTransformController aimed at it (at least
+	// one). Each update writes its interpolator's pose over the root's local transform, part by part, so the root no
+	// longer stands at its reference's placement; the precombines bake such a reference at its placement
+	// (FO4-ENGINE-NOTES 7.16).
+	[[nodiscard]] bool PosedByOwnModel(const RE::NiAVObject* a_root) noexcept;
+	// A reference's placement: the world transform AttachRef3DToParent3D gives its root (rotation
+	// NiMatrix3::FromEulerAnglesXYZ of its angle, translation its location, scale TESObjectREFR::GetScale; 7.16).
+	// Reads the reference only: any thread.
+	[[nodiscard]] RE::NiTransform Placement(const RE::TESObjectREFR* a_ref);
+
+	// Wraps NiTransformController::Update (vtable slot 0x2A), the one writer of a model's pose (FO4-ENGINE-NOTES
+	// 7.16). For an active controller, not driven by a manager, aimed at a reference's 3D root that its model poses
+	// (PosedByOwnModel) under an unrotated, unscaled parent, a_hold(reference) is asked first, on the calling thread:
+	// the cells' animation jobs, not the game thread. When it says yes, every controller on the root is stopped
+	// (NiTimeController::Stop clears the active flag; only effects and projectiles start controllers again) and the
+	// root's local transform is set to the reference's placement, as the precombines draw it. False when the slot
+	// isn't the engine's function (another plugin took it).
+	[[nodiscard]] bool InstallPoseHook(bool (*a_hold)(const RE::TESObjectREFR* a_ref));
+	// Roots held since the last call, and how many of them the pose had already moved (drawn posed until then).
+	void TakePoseHolds(std::uint32_t& a_held, std::uint32_t& a_moved) noexcept;
+
 	// The object's class name (NiRTTI), for the log.
 	[[nodiscard]] const char* ClassName(const RE::NiAVObject* a_object);
 
@@ -177,10 +204,13 @@ namespace RC::Engine
 	// The engine's precombine switch ([General] bUseCombinedObjects), read at every cell load.
 	[[nodiscard]] bool PrecombinesEnabled() noexcept;
 	// The cell's precombined references (extra 0xC5, ExtraCombinedRefs, built from its XCRI record whatever the
-	// precombine switch says; FO4-ENGINE-NOTES 7.12), or null. Main thread.
+	// precombine switch says; FO4-ENGINE-NOTES 7.12), or null. Any thread (the extra list's read lock).
 	[[nodiscard]] const void* CombinedRefs(const RE::TESObjectCELL* a_cell) noexcept;
 	// Whether a_formID is one of them: a reference the precombines draw, with no fade of its own (7.9).
 	[[nodiscard]] bool InCombinedRefs(const void* a_combinedRefs, std::uint32_t a_formID) noexcept;
+	// Appends their form ids to a_out (none on a fault). The set itself is read without a lock, as the engine's
+	// TESObjectCELL::IsCombinedObjectRef reads it after releasing the extra list's lock.
+	void CombinedRefIDs(const void* a_combinedRefs, std::vector<std::uint32_t>& a_out);
 	// The precombined chunks attached in a_cell (its loaded data's combined-object list, FO4-ENGINE-NOTES 7.12),
 	// their world-bound radii appended to a_radii when given.
 	[[nodiscard]] std::uint32_t PrecombinedChunks(const RE::TESObjectCELL* a_cell, std::vector<float>* a_radii = nullptr);
@@ -248,6 +278,47 @@ namespace RC::Engine
 	[[nodiscard]] bool InstallPrevisQueryHook(void (*a_after)());
 	// Milliseconds the engine's previs query took since the last call, and how many times it ran (main thread).
 	[[nodiscard]] double TakePrevisQueryTime(std::uint32_t& a_calls) noexcept;
+
+	// GPU probe: D3D11 pipeline statistics over the whole frame in contiguous segments, switched at DrawWorld::
+	// Render_PreUI's calls and issued on the renderer context the engine draws with (FO4-ENGINE-NOTES 3, 4.1). Read
+	// only; results arrive a few frames late.
+	enum GpuStage : std::size_t
+	{
+		kGpuOutside,       // forward's end to the next cull: post-processing, UI, present, other cameras' passes
+		kGpuCull,          // +0x16A..+0x17A: the cull, rain occlusion, sun-cascade and g-buffer setup
+		kGpuPrePass,       // +0x17F: the deferred pre-pass (z-prepass and g-buffer)
+		kGpuAfterPrePass,  // +0x184..+0x1BA: clears, unbinds, HBAO
+		kGpuLights,        // +0x1BF: sun cascades, lamps' shadow maps and the deferred lights
+		kGpuComposite,     // +0x1C4: the deferred composite
+		kGpuForward,       // +0x1C9: forward (alpha-blended) pass
+		kGpuStageCount
+	};
+	struct GpuStageStats
+	{
+		std::uint64_t frames{ 0 };         // frames whose query was read
+		std::uint64_t skipped{ 0 };        // frames not measured (all queries in flight, or another context)
+		std::uint64_t iaPrimitives{ 0 };   // triangles submitted
+		std::uint64_t cPrimitives{ 0 };    // triangles left after clipping and culling (rasterized)
+		std::uint64_t vsInvocations{ 0 };  // vertices shaded
+		std::uint64_t psInvocations{ 0 };  // pixels shaded
+		std::uint64_t csInvocations{ 0 };  // compute-shader threads
+		double        gpuMs{ 0.0 };        // GPU time between the segment's timestamps, idle included
+		std::uint64_t timed{ 0 };          // frames whose timestamps were read
+	};
+	// GPU time of each image-space effect DrawWorld::DeferredComposite renders, from timestamps around its call.
+	inline constexpr std::size_t kCompositeEffects = 5;
+	struct CompositeEffectStats
+	{
+		char          name[96]{};  // the effect's class (RTTI), empty while it was never seen
+		double        gpuMs{ 0.0 };
+		std::uint64_t timed{ 0 };
+	};
+	[[nodiscard]] std::array<CompositeEffectStats, kCompositeEffects> TakeCompositeEffects() noexcept;
+	// Wraps the boundary calls (any `call rel32` there, so other plugins' wrappers chain); returns how many (all or 0).
+	[[nodiscard]] std::uint32_t InstallGpuStatsProbe();
+	// Sums since the last call (any thread).
+	[[nodiscard]] std::array<GpuStageStats, kGpuStageCount> TakeGpuStats() noexcept;
+	[[nodiscard]] const char* GpuStageName(std::size_t a_stage) noexcept;
 
 
 	// Wraps the cell-buffer purge in Main::PerformGameReset (a save load or new game): a_after runs once every cell
